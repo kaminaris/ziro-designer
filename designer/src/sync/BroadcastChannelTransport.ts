@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 ZiroEDA and contributors.
-import type { EditorKind, PresenceInfo, ProjectSyncPayload, ProjectSyncTransport } from './ProjectSyncTransport.js';
+import type {
+  EditorKind,
+  PresenceInfo,
+  ProjectSyncPayload,
+  ProjectSyncTransport,
+} from './ProjectSyncTransport.js';
 
 type WireMessage =
   | { type: 'hello'; peerId: string; view: EditorKind; sheetPath: string | null }
@@ -28,14 +33,19 @@ export class BroadcastChannelTransport implements ProjectSyncTransport {
   protected channel: BroadcastChannel | null = null;
   protected readonly peers = new Map<string, PresenceInfo>();
   protected readonly lastSeen = new Map<string, number>();
-  protected readonly handlers = new Set<(payload: ProjectSyncPayload, fromPeerId: string) => void>();
+  protected readonly handlers = new Set<
+    (payload: ProjectSyncPayload, fromPeerId: string) => void
+  >();
   protected selfView: EditorKind = 'schematic';
   protected selfSheetPath: string | null = null;
   protected heartbeat: ReturnType<typeof setInterval> | null = null;
   protected readonly heartbeatMs: number;
   protected readonly staleMs: number;
 
-  constructor(protected readonly projectId: string, heartbeatMs = DEFAULT_HEARTBEAT_MS) {
+  constructor(
+    protected readonly projectId: string,
+    heartbeatMs = DEFAULT_HEARTBEAT_MS,
+  ) {
     this.heartbeatMs = heartbeatMs;
     this.staleMs = heartbeatMs * STALE_MULTIPLE;
   }
@@ -75,7 +85,11 @@ export class BroadcastChannelTransport implements ProjectSyncTransport {
   }
 
   publish(payload: ProjectSyncPayload): void {
-    this.channel?.postMessage({ type: 'relay', peerId: this.peerId, payload } satisfies WireMessage);
+    this.channel?.postMessage({
+      type: 'relay',
+      peerId: this.peerId,
+      payload,
+    } satisfies WireMessage);
   }
 
   onMessage(handler: (payload: ProjectSyncPayload, fromPeerId: string) => void): () => void {
@@ -96,7 +110,11 @@ export class BroadcastChannelTransport implements ProjectSyncTransport {
     if (message.peerId === this.peerId) return;
     if (message.type === 'hello') {
       const isNewPeer = !this.peers.has(message.peerId);
-      this.peers.set(message.peerId, { peerId: message.peerId, view: message.view, sheetPath: message.sheetPath });
+      this.peers.set(message.peerId, {
+        peerId: message.peerId,
+        view: message.view,
+        sheetPath: message.sheetPath,
+      });
       this.lastSeen.set(message.peerId, Date.now());
       this.emitPresence();
       if (isNewPeer) this.broadcastHello();

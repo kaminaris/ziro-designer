@@ -29,7 +29,9 @@ describe('BroadcastChannelTransport', () => {
     a.connect('schematic', 'root.kicad_sch');
     b.connect('pcb', null);
 
-    await waitFor(() => aPeers.some((p) => p.includes(b.peerId)) && bPeers.some((p) => p.includes(a.peerId)));
+    await waitFor(
+      () => aPeers.some((p) => p.includes(b.peerId)) && bPeers.some((p) => p.includes(a.peerId)),
+    );
 
     expect(aPeers.some((p) => p.includes(b.peerId))).toBe(true);
     expect(bPeers.some((p) => p.includes(a.peerId))).toBe(true);
@@ -119,7 +121,9 @@ describe('BroadcastChannelTransport', () => {
     await waitFor(() => aPeerLists.some((p) => p.includes(b.peerId)));
 
     b.disconnect();
-    await waitFor(() => aPeerLists.length > 0 && !aPeerLists[aPeerLists.length - 1]!.includes(b.peerId));
+    await waitFor(
+      () => aPeerLists.length > 0 && !aPeerLists[aPeerLists.length - 1]!.includes(b.peerId),
+    );
 
     expect(aPeerLists[aPeerLists.length - 1]).not.toContain(b.peerId);
     a.disconnect();

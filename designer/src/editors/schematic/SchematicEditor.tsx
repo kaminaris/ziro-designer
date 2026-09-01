@@ -928,9 +928,10 @@ export function SchematicEditor({
   // applySheetDocument below — it needs sheetInstanceRefs/applySheetDocument,
   // both defined later in this component, hence the queue rather than
   // applying inline here).
-  const [pendingRemoteChange, setPendingRemoteChange] = useState<{ sheetPath: string; text: string } | null>(
-    null,
-  );
+  const [pendingRemoteChange, setPendingRemoteChange] = useState<{
+    sheetPath: string;
+    text: string;
+  } | null>(null);
   // Last text this tab is responsible for having produced on the active
   // sheet — set both when broadcasting a local edit and when applying a
   // remote one, so applying a remote change doesn't immediately echo it
@@ -9210,7 +9211,10 @@ export function SchematicEditor({
       {/* HOTKEY_CYCLE_POPUP: a wxSTAY_ON_TOP window over the whole frame. */}
       {hotkeyPopup.node}
       {syncPeers.length > 0 && (
-        <div className="ze-presence-badge" title={syncPeers.map((p) => `${p.view} · ${p.sheetPath ?? '/'}`).join('\n')}>
+        <div
+          className="ze-presence-badge"
+          title={syncPeers.map((p) => `${p.view} · ${p.sheetPath ?? '/'}`).join('\n')}
+        >
           {syncPeers.length === 1 ? '1 other viewer' : `${syncPeers.length} other viewers`}
         </div>
       )}

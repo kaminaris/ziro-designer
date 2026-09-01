@@ -10337,10 +10337,7 @@ export function PcbEditor({
   return (
     <div className="ze-app">
       {syncPeers.length > 0 && (
-        <div
-          className="ze-presence-badge"
-          title={syncPeers.map((p) => p.view).join('\n')}
-        >
+        <div className="ze-presence-badge" title={syncPeers.map((p) => p.view).join('\n')}>
           {syncPeers.length === 1 ? '1 other viewer' : `${syncPeers.length} other viewers`}
         </div>
       )}
