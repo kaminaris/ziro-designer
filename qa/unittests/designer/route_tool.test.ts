@@ -18,7 +18,11 @@
  */
 import { describe, expect, it } from 'vitest';
 import { pcbMmToIU as mmToIU } from '@ziroeda/common/src/eda_units.js';
-import { posturePath, routedPath } from '@ziroeda/designer/src/editors/pcb/route_tool.js';
+import {
+  posturePath,
+  routedPath,
+  routeObstacleHulls,
+} from '@ziroeda/designer/src/editors/pcb/route_tool.js';
 import { boardObstacleHulls } from '@ziroeda/pcbnew/src/router/pns_obstacles.js';
 import { pointInside, pointOnEdge } from '@ziroeda/pcbnew/src/router/pns_chain.js';
 import type { Board, PcbTrack, PcbVia } from '@ziroeda/pcbnew/src/types.js';
@@ -132,6 +136,15 @@ describe('when avoidance applies', () => {
     const path = routedPath(P(0, 0), P(30, 0), ctx(blocked));
 
     expect(path[path.length - 1]).toEqual(P(30, 0));
+  });
+
+  it('accepts one precomputed obstacle set for repeated cursor frames', () => {
+    const context = ctx(blocked);
+    const obstacleHulls = routeObstacleHulls(context);
+    expect(obstacleHulls.length).toBeGreaterThan(0);
+    expect(routedPath(P(0, 0), P(30, 0), { ...context, obstacleHulls })).toEqual(
+      routedPath(P(0, 0), P(30, 0), context),
+    );
   });
 });
 

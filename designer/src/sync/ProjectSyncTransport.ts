@@ -9,6 +9,8 @@
  * Realtime channel, cross-device).
  */
 
+import type { BoardPatch } from './pcb_diff.js';
+
 export type EditorKind = 'schematic' | 'pcb' | 'symbol' | 'footprint';
 
 export interface PresenceInfo {
@@ -21,6 +23,25 @@ export interface PresenceInfo {
  *  computes it locally from the peers it has observed. */
 export type ProjectSyncPayload =
   | { kind: 'model-changed'; sheetPath: string; text: string }
+  /** A compact, uuid-keyed diff (pcb_diff.ts) — the fast path for PCB sync,
+   *  used whenever every touched item carries a uuid (real KiCad files
+   *  always do). Falls back to 'model-changed' (whole board text) only
+   *  when that can't be trusted. No schematic equivalent yet — sheets are
+   *  already small enough that whole-text sync hasn't needed this. */
+  | { kind: 'board-patch'; patch: BoardPatch }
+  /**
+   * A live, uncommitted drag preview — PCB only, plain move/drag (not the
+   * router's push-and-shove, which rebuilds stretched geometry every frame
+   * even locally and isn't a good fit for streaming). 'start' names the
+   * moved items once (a patch-shaped snapshot at their pre-drag position);
+   * 'delta' is the cheap, frequent update while the gesture continues;
+   * 'end' (or the eventual 'board-patch' the real commit sends) clears it.
+   * The receiver never commits this — it's the same moveSceneRef + delta
+   * overlay a local drag already draws with, just fed over the wire.
+   */
+  | { kind: 'live-move-start'; patch: BoardPatch }
+  | { kind: 'live-move-delta'; x: number; y: number }
+  | { kind: 'live-move-end' }
   | { kind: 'selection'; refs: string[] }
   | { kind: 'cursor'; x: number; y: number }
   | { kind: 'presence'; peers: PresenceInfo[] };

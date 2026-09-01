@@ -246,7 +246,12 @@ import {
   hasUnlockedItems,
 } from '@ziroeda/pcbnew/src/pcb_selection_conditions.js';
 import { Icon } from '../../ui/icons.js';
-import { posturePath, routedPath as routeDecision } from './route_tool.js';
+import {
+  posturePath,
+  routedPath as routeDecision,
+  routeObstacleHulls,
+} from './route_tool.js';
+import type { Hull } from '@ziroeda/pcbnew/src/router/pns_hull.js';
 import { ReferenceImageCache } from './image_cache.js';
 import { cleanup3dCache } from './model_cache.js';
 import { buildPcbMenus } from './menubar.js';
@@ -498,6 +503,8 @@ import {
 import { PcbPropertiesPanel } from './PcbPropertiesPanel.js';
 import { createProjectSyncTransport } from '../../sync/createProjectSyncTransport.js';
 import type { PresenceInfo, ProjectSyncTransport } from '../../sync/ProjectSyncTransport.js';
+import { serializeBoardAsync, parseBoardAsync } from '../../sync/pcb_sync_pool.js';
+import { diffBoard, applyBoardPatch, patchIsEmpty, type BoardPatch } from '../../sync/pcb_diff.js';
 import {
   pcbItemFriendlyName,
   pcbPropertiesFor,
@@ -904,7 +911,101 @@ function emptyBoardLike(board: Board): Board {
     texts: [],
     textBoxes: [],
     tables: [],
+    images: [],
+    dimensions: [],
     groups: [],
+  };
+}
+
+/**
+ * A board with the given items (by uuid) filtered out of the collections a
+ * live drag can touch — designer/src/sync/, no upstream counterpart. Used
+ * to pull a remote peer's dragged items out of the settled scene once, up
+ * front, so the live-move overlay isn't drawing a second copy on top of the
+ * original still sitting in the base raster.
+ */
+function boardMinusUuids(board: Board, uuids: ReadonlySet<string>): Board {
+  const keep = <T extends { uuid?: string }>(items: readonly T[]): T[] =>
+    items.filter((item) => !item.uuid || !uuids.has(item.uuid));
+  return {
+    ...board,
+    footprints: keep(board.footprints),
+    tracks: keep(board.tracks),
+    arcs: keep(board.arcs),
+    vias: keep(board.vias),
+  };
+}
+
+/**
+ * The board-item ids (`kind:index`, what the renderer and the GPU recorder
+ * key on) for the items a remote drag's `live-move-start` patch names by
+ * uuid — designer/src/sync/, no upstream counterpart.
+ *
+ * The two namespaces are not interchangeable and this is the only bridge
+ * between them: the wire speaks uuid, because an index is meaningless in
+ * another tab's board; `PcbGl.moveItems`/`canMoveItems` speak `kind:index`,
+ * because that is what `itemRanges` recorded. Resolved against the
+ * *receiver's* own board so a divergent collection order cannot move the
+ * wrong item — a uuid this board doesn't have simply contributes nothing,
+ * and `canMoveItems` then declines the in-place path for the whole gesture.
+ *
+ * Only the four collections a plain move/drag can touch, matching what
+ * `beginMove` broadcasts.
+ */
+function remoteMoveTargetIds(board: Board, patch: BoardPatch): Set<string> {
+  const ids = new Set<string>();
+  const collect = (
+    kind: BoardItemKind,
+    items: readonly { uuid?: string }[],
+    cp?: { upsert: readonly { uuid?: string }[] },
+  ): void => {
+    if (!cp || cp.upsert.length === 0) return;
+    const want = new Set<string>();
+    for (const item of cp.upsert) if (item.uuid) want.add(item.uuid);
+    if (want.size === 0) return;
+    items.forEach((item, i) => {
+      if (item.uuid && want.has(item.uuid)) ids.add(boardItemId(kind, i));
+    });
+  };
+  collect('footprint', board.footprints, patch.footprints);
+  collect('track', board.tracks, patch.tracks);
+  collect('arc', board.arcs, patch.arcs);
+  collect('via', board.vias, patch.vias);
+  return ids;
+}
+
+/**
+ * The general form of boardMinusUuids, above, for applying a received
+ * board-patch (designer/src/sync/) — unlike a plain drag (footprints/tracks/
+ * arcs/vias only), a patch can touch any of the twelve item collections.
+ * Every item a collection's upsert or remove names is pulled out, so the
+ * committed-position overlay drawn on top of this isn't sharing the canvas
+ * with the stale pre-patch copy still sitting in the base raster.
+ */
+function boardMinusPatch(board: Board, patch: BoardPatch): Board {
+  const uuidsOf = (cp?: { upsert: readonly { uuid?: string }[]; remove: readonly string[] }) => {
+    const s = new Set<string>(cp?.remove ?? []);
+    for (const item of cp?.upsert ?? []) if (item.uuid) s.add(item.uuid);
+    return s;
+  };
+  const keep = <T extends { uuid?: string }>(
+    items: readonly T[],
+    uuids: ReadonlySet<string>,
+  ): T[] => items.filter((item) => !item.uuid || !uuids.has(item.uuid));
+  return {
+    ...board,
+    footprints: keep(board.footprints, uuidsOf(patch.footprints)),
+    tracks: keep(board.tracks, uuidsOf(patch.tracks)),
+    arcs: keep(board.arcs, uuidsOf(patch.arcs)),
+    vias: keep(board.vias, uuidsOf(patch.vias)),
+    zones: keep(board.zones, uuidsOf(patch.zones)),
+    shapes: keep(board.shapes, uuidsOf(patch.shapes)),
+    texts: keep(board.texts, uuidsOf(patch.texts)),
+    textBoxes: keep(board.textBoxes, uuidsOf(patch.textBoxes)),
+    tables: keep(board.tables, uuidsOf(patch.tables)),
+    images: keep(board.images, uuidsOf(patch.images)),
+    dimensions: keep(board.dimensions, uuidsOf(patch.dimensions)),
+    groups: keep(board.groups, uuidsOf(patch.groups)),
   };
 }
 
@@ -1347,12 +1448,12 @@ export function PcbEditor({
     syncNonceRef.current += 1;
     onSyncSelectionToSch({ parts, nonce: syncNonceRef.current });
   }, [selection, onSyncSelectionToSch]);
-  // Live cross-tab presence/cursor sync (designer/src/sync/), mirroring the
-  // schematic editor's. Presence + remote cursor only for this pass — PCB
-  // edits still go through commitBoard's whole-board snapshots (50+ call
-  // sites), not a discrete command log, so there is no safe single choke
-  // point yet to hang live document sync off; see the PCB op-log refactor
-  // this is waiting on.
+  // Live cross-tab presence/cursor/document sync (designer/src/sync/),
+  // mirroring the schematic editor's. commitBoard (below) is the one choke
+  // point every board edit already goes through — the same shape as
+  // applySheetDocument on the schematic side — so live document sync rides
+  // it directly; no PCB-side command log needed for this, unlike what an
+  // eventual real merge (rather than last-writer-wins) would require.
   const syncTransport = useRef<ProjectSyncTransport | null>(null);
   const [syncPeers, setSyncPeers] = useState<PresenceInfo[]>([]);
   // Read by draw() via .current, same as cursorRef — avoids adding a state
@@ -1360,6 +1461,54 @@ export function PcbEditor({
   const remoteCursorsRef = useRef<Map<string, { x: number; y: number }>>(new Map());
   const lastCursorBroadcast = useRef(0);
   const CURSOR_BROADCAST_MS = 80;
+  // A remote board update waiting to be applied — queued rather than applied
+  // inline because commitBoard is defined later in this component (see the
+  // effect right after its declaration below). 'patch' is the fast path
+  // (pcb_diff.ts); 'text' is the whole-board fallback for when a patch
+  // can't be trusted (some touched item has no uuid).
+  const [pendingRemoteBoard, setPendingRemoteBoard] = useState<
+    { kind: 'patch'; patch: BoardPatch } | { kind: 'text'; text: string } | null
+  >(null);
+  // Text this tab is responsible for having produced, for the whole-board
+  // fallback path's echo suppression (same technique as the schematic
+  // editor). The patch path uses prevSyncedBoardRef instead (below).
+  const lastKnownBoardText = useRef<string | null>(null);
+  // The board state this tab last broadcast (or last applied FROM a remote
+  // peer) — diffBoard's baseline. Null until the first broadcast effect run
+  // seeds it, so the very first edit doesn't diff against nothing and
+  // produce a "the whole board is new" patch.
+  const prevSyncedBoardRef = useRef<Board | null>(null);
+  // True for exactly the one board-state change caused by applying a
+  // remote update. commitBoard can transform `next` further (teardrops),
+  // so the broadcast effect below can't predict the resulting board's
+  // identity — this flag is checked instead of guessing a reference.
+  const applyingRemoteRef = useRef(false);
+  // Live drag-preview broadcast state (sender side). liveMoveActiveRef
+  // guards the throttled delta broadcast to only fire while an actual
+  // local plain move/drag is in progress (see updateMove and its
+  // drag-start/drag-end call sites).
+  const liveMoveActiveRef = useRef(false);
+  const lastLiveMoveBroadcast = useRef(0);
+  const LIVE_MOVE_BROADCAST_MS = 80;
+  // Whether a remote peer's live drag is currently being shown here (through
+  // either of the two paths below) — so the real local drag-start/drag-end
+  // code doesn't stomp on it, and so a later local drag is free to take the
+  // overlay back over.
+  const remoteLiveMoveActiveRef = useRef(false);
+  /**
+   * The remote-drag mirror of `inPlaceMoveRef`/`dragAffectedRef`: the delta
+   * already pushed into the retained GPU buffer for a peer's drag, and the
+   * board-item ids it was pushed for. `null` means this remote drag is on
+   * the overlay fallback (Canvas2D, or items the recorder never named)
+   * rather than the in-place path.
+   *
+   * Kept separate from the local `inPlaceMoveRef`/`dragAffectedRef` rather
+   * than sharing them: those two are also read by `endMove`/`cancelMove`,
+   * which fire off a *local* pointer gesture, and a stray click here during
+   * someone else's drag must not be able to commit or unwind their move.
+   */
+  const remoteInPlaceRef = useRef<{ x: number; y: number } | null>(null);
+  const remoteAffectedRef = useRef<ReadonlySet<string>>(new Set());
   useEffect(() => {
     if (!projectName) return undefined;
     const transport = createProjectSyncTransport(projectName);
@@ -1374,6 +1523,165 @@ export function PcbEditor({
       } else if (payload.kind === 'cursor') {
         remoteCursorsRef.current.set(fromPeerId, { x: payload.x, y: payload.y });
         requestDrawRef.current();
+      } else if (payload.kind === 'board-patch') {
+        // Clear the stale drag delta too — the commit-apply effect below
+        // sets its own fresh overlay at the item's final (absolute)
+        // position, and a leftover non-zero moveDeltaRef would offset that
+        // overlay by wherever the drag last was.
+        //
+        // `remoteInPlaceRef` is deliberately NOT unwound here: the buffer's
+        // translated vertices are already sitting at the position this
+        // patch is about to make official, so leaving them put is what
+        // keeps the hand-off seamless. The apply effect reads the flag to
+        // know it can skip the overlay entirely, then clears it.
+        remoteLiveMoveActiveRef.current = false;
+        moveDeltaRef.current = null;
+        setPendingRemoteBoard({ kind: 'patch', patch: payload.patch });
+      } else if (payload.kind === 'model-changed') {
+        remoteLiveMoveActiveRef.current = false;
+        remoteInPlaceRef.current = null;
+        moveDeltaRef.current = null;
+        setPendingRemoteBoard({ kind: 'text', text: payload.text });
+      } else if (payload.kind === 'live-move-start') {
+        // Don't fight a local drag already using moveSceneRef — the far
+        // rarer case, and it self-resolves on the next 'end'/commit.
+        if (liveMoveActiveRef.current) {
+          return;
+        }
+        const brd = boardRef.current;
+        if (!brd) return;
+        const uuids = new Set<string>([
+          ...(payload.patch.footprints?.upsert.map((f) => f.uuid).filter((u): u is string => !!u) ??
+            []),
+          ...(payload.patch.tracks?.upsert.map((t) => t.uuid).filter((u): u is string => !!u) ??
+            []),
+          ...(payload.patch.arcs?.upsert.map((a) => a.uuid).filter((u): u is string => !!u) ?? []),
+          ...(payload.patch.vias?.upsert.map((v) => v.uuid).filter((u): u is string => !!u) ?? []),
+        ]);
+        const preview: Board = {
+          ...emptyBoardLike(brd),
+          footprints: payload.patch.footprints?.upsert ?? [],
+          tracks: payload.patch.tracks?.upsert ?? [],
+          arcs: payload.patch.arcs?.upsert ?? [],
+          vias: payload.patch.vias?.upsert ?? [],
+        };
+        remoteLiveMoveActiveRef.current = true;
+        // The fast path, and the whole reason a LOCAL drag is smooth: the
+        // moved items keep their place in the retained GPU buffer and their
+        // vertices are shifted there each frame. Nothing is rebuilt, nothing
+        // is re-recorded, nothing is drawn twice.
+        //
+        // The overlay path below cannot do that. It has to compile a base
+        // scene with the moved items taken out, and `buildBoardScene` costs
+        // the same whether it excludes one item or none — a full recompile
+        // of the board (~220ms on a 7.6MB board, and the GPU re-record it
+        // triggers was measured at 1228ms on the coldfire demo). Worse, what
+        // is on screen is not `sceneRef` but the raster/buffer built FROM it,
+        // so until that recompile lands the base still shows the item at its
+        // old position while the overlay draws it at the new one — the ghost
+        // — and the recompile landing is itself the full-board repaint — the
+        // flicker. Both reported symptoms were this one choice.
+        //
+        // So: take the same in-place branch `beginMove` takes, on the same
+        // conditions, and leave the overlay as the fallback it is locally.
+        const affected = remoteMoveTargetIds(brd, payload.patch);
+        const gl = glRef.current;
+        const inPlace =
+          affected.size > 0 &&
+          gl !== null &&
+          !gl.isLost &&
+          glOkRef.current &&
+          !glBlockedRef.current &&
+          sceneIsGlRef.current &&
+          gl.canMoveItems(affected);
+        if (inPlace) {
+          remoteAffectedRef.current = affected;
+          remoteInPlaceRef.current = { x: 0, y: 0 };
+          // No overlay and no base rebuild: the items are moving where they
+          // already are. `draw()` picks the shift up for the screen-space
+          // passes (anchors, pad labels) that are drawn from `scene` rather
+          // than from the buffer.
+          moveSceneRef.current = null;
+          moveDeltaRef.current = null;
+          requestDrawRef.current();
+          return;
+        }
+        remoteInPlaceRef.current = null;
+        // Overlay fallback. Cheap half first (the preview), expensive half
+        // — the base minus the moved items — deferred off the critical path,
+        // exactly as `startOverlayMove`/`scheduleBaseWithout` do locally.
+        moveSceneRef.current = buildScene(preview, sceneFilter());
+        moveDeltaRef.current = { x: 0, y: 0 };
+        requestDrawRef.current();
+        const token = ++baseRebuildRef.current;
+        setTimeout(() => {
+          // Superseded by a newer drag, or this one already ended
+          // ('live-move-end'/'board-patch' already rebuilt the scene for
+          // real) — either way the exclusion below would be stale.
+          if (token !== baseRebuildRef.current || !remoteLiveMoveActiveRef.current) {
+            return;
+          }
+          sceneRef.current = buildBoardScene(boardMinusUuids(brd, uuids), sceneFilter());
+          sceneDirtyRef.current = true;
+          requestDrawRef.current();
+        }, 0);
+      } else if (payload.kind === 'live-move-delta') {
+        if (!remoteLiveMoveActiveRef.current) {
+          return;
+        }
+        const applied = remoteInPlaceRef.current;
+        if (applied) {
+          // Only the change since the last message: the buffer holds the rest.
+          const gl = glRef.current;
+          if (
+            gl &&
+            gl.moveItems(remoteAffectedRef.current, payload.x - applied.x, payload.y - applied.y)
+          ) {
+            remoteInPlaceRef.current = { x: payload.x, y: payload.y };
+            requestDrawRef.current();
+            return;
+          }
+          // The GPU could not take it after all. Unlike the local fallback
+          // there is no cursor to keep up with, and the board-patch behind
+          // this drag is at most a few hundred ms away, so rather than
+          // standing up an overlay mid-gesture just stop previewing: the
+          // items stay where the buffer last put them and the patch corrects
+          // them. Undoing the partial shift here would show them snapping
+          // BACK before jumping forward, which is worse than a short pause.
+          remoteInPlaceRef.current = null;
+          remoteLiveMoveActiveRef.current = false;
+          return;
+        }
+        moveDeltaRef.current = { x: payload.x, y: payload.y };
+        requestDrawRef.current();
+      } else if (payload.kind === 'live-move-end') {
+        if (!remoteLiveMoveActiveRef.current) return;
+        remoteLiveMoveActiveRef.current = false;
+        const applied = remoteInPlaceRef.current;
+        remoteInPlaceRef.current = null;
+        if (applied) {
+          // 'end' without a board-patch behind it means the gesture produced
+          // no move (grabbed and released, or Esc), so the items belong back
+          // where they started. Shifting the buffer back is the exact inverse
+          // of what got them here — no rebuild, same as `cancelMove` does for
+          // a local in-place drag.
+          if (applied.x !== 0 || applied.y !== 0)
+            glRef.current?.moveItems(remoteAffectedRef.current, -applied.x, -applied.y);
+          remoteAffectedRef.current = new Set();
+          requestDrawRef.current();
+          return;
+        }
+        moveSceneRef.current = null;
+        moveDeltaRef.current = null;
+        // The overlay fallback's zero-delta case: no board-patch follows to
+        // rebuild sceneRef.current, so the items pulled out at
+        // live-move-start have to go back in explicitly here.
+        const brd = boardRef.current;
+        if (brd) {
+          sceneRef.current = buildBoardScene(brd, sceneFilter());
+          sceneDirtyRef.current = true;
+        }
+        requestDrawRef.current();
       }
     });
     return () => {
@@ -1383,6 +1691,57 @@ export function PcbEditor({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectName]);
+  // Broadcast board edits (designer/src/sync/), debounced so a run of small
+  // edits collapses into one message. Prefers the compact uuid-keyed diff
+  // (pcb_diff.ts) — a moved footprint or a shoved trace is then a handful of
+  // items, not the whole board's text — falling back to whole-board text
+  // only when a patch can't be trusted (some touched item has no uuid).
+  // Skipped entirely when this change is one just applied FROM a remote
+  // peer (applyingRemoteRef) — otherwise applying one would immediately
+  // echo it straight back out.
+  useEffect(() => {
+    if (!board) return undefined;
+    if (applyingRemoteRef.current) {
+      applyingRemoteRef.current = false;
+      prevSyncedBoardRef.current = board;
+      return undefined;
+    }
+    if (prevSyncedBoardRef.current === null) {
+      prevSyncedBoardRef.current = board; // seed: nothing to diff against yet
+      return undefined;
+    }
+    const prevForDiff = prevSyncedBoardRef.current;
+    if (prevForDiff === board) return undefined; // nothing actually changed
+    const patch = diffBoard(prevForDiff, board);
+    if (patch !== null) {
+      const timer = setTimeout(() => {
+        if (patchIsEmpty(patch)) return;
+        prevSyncedBoardRef.current = board;
+        syncTransport.current?.publish({ kind: 'board-patch', patch });
+      }, 400);
+      return () => clearTimeout(timer);
+    }
+    // Fallback: some touched item has no uuid, diff can't be trusted.
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      // Off the main thread (pcb_sync_pool.ts) — serializing this board
+      // measured ~80ms synchronous on GigaMicroEPCV2, long enough to drop
+      // frames mid-gesture if done inline here.
+      void serializeBoardAsync(board)
+        .then((text) => {
+          if (cancelled) return; // board moved on again before this resolved
+          if (text === lastKnownBoardText.current) return;
+          lastKnownBoardText.current = text;
+          prevSyncedBoardRef.current = board;
+          syncTransport.current?.publish({ kind: 'model-changed', sheetPath: 'board', text });
+        })
+        .catch(() => {});
+    }, 400);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [board]);
   // Disambiguation menu (PCB_SELECTION_TOOL::doSelectionMenu): shown at a click
   // that hits several equally-plausible items so the user can pick one.
   const [disambig, setDisambig] = useState<{
@@ -1824,6 +2183,14 @@ export function PcbEditor({
     layer: string;
     last: { x: number; y: number };
     dims: ClassDims;
+  } | null>(null);
+  const routeObstacleCacheRef = useRef<{
+    board: Board;
+    net: number;
+    layer: string;
+    width: number;
+    clearance: number;
+    hulls: readonly Hull[];
   } | null>(null);
   // Pending "Add Text" dialog: where the text will be placed.
   // Page Settings / Print dialogs (DIALOG_PAGES_SETTINGS / DIALOG_PRINT_PCBNEW).
@@ -2879,13 +3246,28 @@ export function PcbEditor({
     // anchor crosses and the pad numbers / net names. Null unless such a drag
     // is in flight — the overlay path takes the moving items out of `scene`
     // altogether and draws their own copy, so it needs no offset here.
-    const inPlaceShift = inPlaceMoveRef.current
-      ? {
-          ids: dragAffectedRef.current,
-          dx: inPlaceMoveRef.current.x,
-          dy: inPlaceMoveRef.current.y,
-        }
-      : null;
+    // A remote peer's drag takes the same in-place path (designer/src/sync/),
+    // through its own pair of refs, and needs the identical treatment here —
+    // without this the part slides but its anchor cross and pad numbers stay
+    // pinned to where it started. The two are mutually exclusive: a tab
+    // ignores an incoming live-move while its own drag is running, and vice
+    // versa, so whichever is set is the one in flight.
+    const localShift = inPlaceMoveRef.current;
+    const remoteShift = remoteInPlaceRef.current;
+    const inPlaceShift = localShift
+      ? { ids: dragAffectedRef.current, dx: localShift.x, dy: localShift.y }
+      : remoteShift
+        ? { ids: remoteAffectedRef.current, dx: remoteShift.x, dy: remoteShift.y }
+        : null;
+    // Selection is a separately compiled Canvas2D repaint. During a remote
+    // in-place move the retained GL geometry moves, but that cached selection
+    // copy does not; drawing both leaves a full duplicate at the old position
+    // until the committed board rebuilds it on mouse-up. Suppress only when
+    // the remote move and this tab's own selection overlap. Unrelated selected
+    // items keep their normal highlight.
+    const remoteSelectionConflict =
+      remoteShift !== null &&
+      [...remoteAffectedRef.current].some((id) => selForDrawRef.current.has(id));
     if (objects.anchors) {
       drawAnchors(
         bctx,
@@ -3151,7 +3533,7 @@ export function PcbEditor({
     {
       const sel = selForDrawRef.current;
       const brd = boardRef.current;
-      if (brd) {
+      if (brd && !remoteSelectionConflict) {
         const md = moveDeltaRef.current;
         const off = !dragModeRef.current && md ? md : { x: 0, y: 0 };
         ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -3218,7 +3600,7 @@ export function PcbEditor({
     // (EDIT_POINTS::ViewDraw; POINT_SIZE 8, BORDER_SIZE 3, HOVER_SIZE 6).
     {
       const handles = editHandlesRef.current;
-      if (handles.length > 0 && !moveDeltaRef.current) {
+      if (handles.length > 0 && !moveDeltaRef.current && !remoteSelectionConflict) {
         ctx.setTransform(1, 0, 0, 1, 0, 0);
         const half = (EDIT_POINT_SIZE / 2) * dpr;
         const hovered = hoveredEditHandleRef.current;
@@ -3298,7 +3680,7 @@ export function PcbEditor({
     }
     {
       const md = moveDeltaRef.current;
-      const os = moveSceneRef.current ?? selSceneRef.current;
+      const os = moveSceneRef.current ?? (remoteSelectionConflict ? null : selSceneRef.current);
       if (os) {
         // A drag overlay, a stretched footprint drag or a re-cut router drag ,
         // is already at its absolute coords; only a move overlay is the static
@@ -4198,6 +4580,117 @@ export function PcbEditor({
     },
     [setBoardModel],
   );
+
+  // Apply a queued remote board update (designer/src/sync/). Reuses
+  // commitBoard, the same choke point every local edit goes through, so a
+  // bad remote update is one Ctrl+Z away — not a merge, last update wins.
+  useEffect(() => {
+    if (!pendingRemoteBoard) return;
+    const pending = pendingRemoteBoard;
+    setPendingRemoteBoard(null);
+    if (pending.kind === 'patch') {
+      // Fast path: applying a diff is cheap (splicing a handful of items),
+      // no worker hop needed the way the whole-board fallback below does.
+      const brd = boardRef.current;
+      if (!brd) return;
+      const next = applyBoardPatch(brd, pending.patch);
+
+      // The hand-off from a remote in-place drag (designer/src/sync/): the
+      // GPU buffer is already showing these items exactly where this patch
+      // is about to put them, so there is nothing to preview and nothing to
+      // hide. Going through the overlay path below would mean two full
+      // `buildBoardScene` calls to arrive back at the picture already on
+      // screen — which is the flicker at the END of every remote drag, the
+      // mirror of the one at its start. Commit straight away and let the
+      // rebuild swap the translated buffer for a freshly recorded one.
+      if (remoteInPlaceRef.current) {
+        remoteInPlaceRef.current = null;
+        remoteAffectedRef.current = new Set();
+        applyingRemoteRef.current = true;
+        commitBoard(next);
+        return;
+      }
+
+      // Paint the changed items immediately, the same trick a local drag
+      // already uses (moveSceneRef: a small scene for just the moved
+      // subset, drawn over the still-stale full scene) — a remote update
+      // has no in-progress drag to ride, so without this the change sits
+      // invisible until the full board scene finishes rebuilding, which is
+      // the ~2s a receiving tab was showing (measured: rebuildScene alone
+      // took ~220ms synchronous on GigaMicroEPCV2, before the async raster
+      // sharpening pass on top — local dragging never blocks on either,
+      // because the overlay is already showing the right thing by then).
+      const preview: Board = {
+        ...emptyBoardLike(brd),
+        footprints: pending.patch.footprints?.upsert ?? [],
+        tracks: pending.patch.tracks?.upsert ?? [],
+        arcs: pending.patch.arcs?.upsert ?? [],
+        vias: pending.patch.vias?.upsert ?? [],
+        zones: pending.patch.zones?.upsert ?? [],
+        shapes: pending.patch.shapes?.upsert ?? [],
+        texts: pending.patch.texts?.upsert ?? [],
+        textBoxes: pending.patch.textBoxes?.upsert ?? [],
+        tables: pending.patch.tables?.upsert ?? [],
+        images: pending.patch.images?.upsert ?? [],
+        dimensions: pending.patch.dimensions?.upsert ?? [],
+        groups: pending.patch.groups?.upsert ?? [],
+      };
+      moveSceneRef.current = buildScene(preview, sceneFilter());
+      requestDraw();
+
+      // Pull the patch's own prior copies out of the base scene — the same
+      // reason live-move-start does this for a drag's narrower 4 collections
+      // (above): without it, the overlay above draws the new position on top
+      // of a base raster that still has the old one, so every non-drag
+      // remote edit (rotate, delete, nudge, …) ghosts a stale duplicate.
+      // Deferred rather than run inline before the paint above — this is a
+      // second full `buildBoardScene` (as expensive as the one commitBoard
+      // is about to do below), and doing it synchronously first meant every
+      // remote edit blocked the main thread for the rebuild's ~220ms *twice*
+      // before showing anything, which is what actually read as flicker.
+      // `scheduleBaseWithout` uses the same deferral for a local drag's
+      // narrower exclusion; `baseRebuildRef`'s token covers both, so a newer
+      // drag/patch — or commitBoard's own rebuildScene below, which bumps it
+      // first thing — supersedes this cleanly if it lands first.
+      const token = ++baseRebuildRef.current;
+      setTimeout(() => {
+        if (token !== baseRebuildRef.current) return;
+        sceneRef.current = buildBoardScene(boardMinusPatch(brd, pending.patch), sceneFilter());
+        sceneDirtyRef.current = true;
+        requestDraw();
+      }, 0);
+
+      // commitBoard's rebuildScene is synchronous (~220ms on this board) —
+      // calling it right here, in the same tick as the requestDraw above,
+      // would cancel that draw before the browser ever paints it (requestDraw
+      // does cancelAnimationFrame + reschedule). Double rAF: the first fires
+      // once the overlay's frame has actually been painted; only then is it
+      // safe to do the heavy synchronous work and drop the overlay.
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          applyingRemoteRef.current = true;
+          commitBoard(next);
+          // rebuildScene (inside commitBoard) already rebuilt sceneRef.current
+          // synchronously by the time commitBoard returns, so the overlay can
+          // come off immediately — no gap where neither is showing.
+          moveSceneRef.current = null;
+          requestDraw();
+        });
+      });
+      return;
+    }
+    const text = pending.text;
+    // Off the main thread (pcb_sync_pool.ts) — parse+readBoard measured
+    // ~160ms synchronous on GigaMicroEPCV2, which is exactly the kind of
+    // main-thread stall that made a local in-progress edit look corrupted.
+    void parseBoardAsync(text)
+      .then((next) => {
+        lastKnownBoardText.current = text;
+        applyingRemoteRef.current = true;
+        commitBoard(next);
+      })
+      .catch(() => {}); // malformed text mid-broadcast; wait for the next update
+  }, [pendingRemoteBoard, commitBoard]);
 
   // ----- Update PCB from Schematic (BOARD_EDITOR_CONTROL::UpdatePCBFromSchematic) --
 
@@ -6755,13 +7248,33 @@ export function PcbEditor({
     const brd = boardRef.current;
     const r = routeRef.current;
     if (!brd || !r) return posturePath(from, to);
-
+    const clearance = netclassInfo.classClearance.get(netClassOf.get(r.net) ?? 'Default') ?? 0;
+    let cached = routeObstacleCacheRef.current;
+    if (
+      !cached ||
+      cached.board !== brd ||
+      cached.net !== r.net ||
+      cached.layer !== r.layer ||
+      cached.width !== r.dims.trackWidth ||
+      cached.clearance !== clearance
+    ) {
+      const context = {
+        board: brd,
+        net: r.net,
+        layer: r.layer,
+        width: r.dims.trackWidth,
+        clearance,
+      };
+      cached = { ...context, hulls: routeObstacleHulls(context) };
+      routeObstacleCacheRef.current = cached;
+    }
     return routeDecision(from, to, {
       board: brd,
       net: r.net,
       layer: r.layer,
       width: r.dims.trackWidth,
-      clearance: netclassInfo.classClearance.get(netClassOf.get(r.net) ?? 'Default') ?? 0,
+      clearance,
+      obstacleHulls: cached.hulls,
     });
   };
 
@@ -7620,6 +8133,26 @@ export function PcbEditor({
         ? beginCourtyardConflicts(brd, fpIdx)
         : null;
     conflictsRef.current = null;
+    // Tell other viewers this drag started, once, with a snapshot of what's
+    // moving (designer/src/sync/) — cheap per-frame deltas follow from
+    // updateMove below. Not the router's push-and-shove (that one rebuilds
+    // stretched geometry every frame even locally; no live sync for it yet).
+    if (!remoteLiveMoveActiveRef.current) {
+      const subset = subsetBoardItems(brd, affected);
+      liveMoveActiveRef.current = true;
+      lastLiveMoveBroadcast.current = 0;
+      syncTransport.current?.publish({
+        kind: 'live-move-start',
+        patch: {
+          footprints: subset.footprints.length
+            ? { upsert: subset.footprints, remove: [] }
+            : undefined,
+          tracks: subset.tracks.length ? { upsert: subset.tracks, remove: [] } : undefined,
+          arcs: subset.arcs.length ? { upsert: subset.arcs, remove: [] } : undefined,
+          vias: subset.vias.length ? { upsert: subset.vias, remove: [] } : undefined,
+        },
+      });
+    }
     // The fast path, and what KiCad does: the items keep their place in the
     // retained buffer and their vertices are shifted there each frame, so
     // nothing is rebuilt, re-recorded or drawn twice. Only when the GPU cannot
@@ -8149,6 +8682,13 @@ export function PcbEditor({
     const anchor = moveAnchorRef.current ?? origin;
     const delta = moveDelta(anchor, origin, cur, moveSnap);
     moveDeltaRef.current = delta;
+    if (liveMoveActiveRef.current) {
+      const now = Date.now();
+      if (now - lastLiveMoveBroadcast.current >= LIVE_MOVE_BROADCAST_MS) {
+        lastLiveMoveBroadcast.current = now;
+        syncTransport.current?.publish({ kind: 'live-move-delta', x: delta.x, y: delta.y });
+      }
+    }
     forcedCursorRef.current = { x: anchor.x + delta.x, y: anchor.y + delta.y };
     // `drc_on_move->Run(); drc_on_move->UpdateConflicts( view, true )` (:1207).
     // Before the in-place branch returns: every path through this function is a
@@ -8270,18 +8810,42 @@ export function PcbEditor({
       }
       return;
     }
-    if (brd && delta && (delta.x !== 0 || delta.y !== 0)) {
+    const hadRealMove = !!(brd && delta && (delta.x !== 0 || delta.y !== 0));
+    if (hadRealMove) {
+      // The pointer stream is throttled, so its last broadcast can be one or
+      // more cursor samples behind mouse-up. Send the exact committed delta
+      // before commitBoard queues its debounced patch; BroadcastChannel keeps
+      // message order, so peers move the retained buffer to the drop position
+      // before replacing it with the committed scene. Without this, the last
+      // preview sat briefly at the penultimate position and looked like a
+      // release-time ghost.
+      if (liveMoveActiveRef.current) {
+        syncTransport.current?.publish({ kind: 'live-move-delta', x: delta!.x, y: delta!.y });
+      }
       commitBoard(
-        kind === 'drag' ? dragBoardItems(brd, sel, delta) : moveBoardItems(brd, sel, delta),
+        kind === 'drag' ? dragBoardItems(brd, sel, delta!) : moveBoardItems(brd, sel, delta!),
       );
     } else if (hadOverlay && brd) {
       rebuildScene(brd);
+    }
+    if (liveMoveActiveRef.current) {
+      liveMoveActiveRef.current = false;
+      // Only for the zero-delta ("clicked, didn't move") case: a real move's
+      // own board-patch (debounced, ~400ms out) already replaces the preview
+      // overlay with the committed one when it lands — sending 'end' here
+      // too would clear it early and flash the pre-drag position for that
+      // gap before the real update arrives.
+      if (!hadRealMove) syncTransport.current?.publish({ kind: 'live-move-end' });
     }
   };
 
   // Abandon the gesture without committing (Esc), restoring the full scene.
   const cancelMove = (): void => {
     const brd = boardRef.current;
+    if (liveMoveActiveRef.current) {
+      liveMoveActiveRef.current = false;
+      syncTransport.current?.publish({ kind: 'live-move-end' });
+    }
     trackDragRef.current = null;
     restoreDragHighlight();
     // An in-place move only ever shifted vertices, so undoing it is the same

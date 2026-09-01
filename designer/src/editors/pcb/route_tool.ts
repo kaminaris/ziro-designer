@@ -20,6 +20,7 @@
  * cannot drift.
  */
 import { boardObstacleHulls } from '@ziroeda/pcbnew/src/router/pns_obstacles.js';
+import type { Hull } from '@ziroeda/pcbnew/src/router/pns_hull.js';
 import { optimize } from '@ziroeda/pcbnew/src/router/pns_optimizer.js';
 import { nearestObstacle, routeShortest } from '@ziroeda/pcbnew/src/router/pns_walkaround.js';
 import type { Board } from '@ziroeda/pcbnew/src/types.js';
@@ -57,6 +58,19 @@ export interface RouteContext {
   width: number;
   /** Clearance the route must keep from other nets; zero disables avoidance. */
   clearance: number;
+  /** Precomputed for an interactive routing session; cursor movement does not change them. */
+  obstacleHulls?: readonly Hull[];
+}
+
+/** Build the cursor-independent obstacle set once when a routing context changes. */
+export function routeObstacleHulls(ctx: RouteContext): Hull[] {
+  if (ctx.clearance <= 0) return [];
+  return boardObstacleHulls(ctx.board, {
+    net: ctx.net,
+    layer: ctx.layer,
+    width: ctx.width,
+    clearance: ctx.clearance,
+  });
 }
 
 /**
@@ -96,12 +110,7 @@ export function routedPath(from: Vec2, to: Vec2, ctx: RouteContext): Vec2[] {
 
   if (ctx.clearance <= 0) return direct;
 
-  const hulls = boardObstacleHulls(ctx.board, {
-    net: ctx.net,
-    layer: ctx.layer,
-    width: ctx.width,
-    clearance: ctx.clearance,
-  });
+  const hulls = ctx.obstacleHulls ?? routeObstacleHulls(ctx);
   // A cost guard, not a behavioural one: with no hulls the walk returns the
   // input untouched and the answer is the same either way. It is here so the
   // common case — an empty board, or a layer with nothing foreign on it —

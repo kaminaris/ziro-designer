@@ -158,7 +158,9 @@ describe('the overlay fallback is wired for a drag that started in place', () =>
   });
 
   it('the failure branch does more than clear the flag', () => {
-    const i = text.indexOf('The GPU could not take it after all');
+    const i = text.indexOf(
+      'The GPU could not take it after all; fall back for the rest of the drag.',
+    );
     expect(i).toBeGreaterThan(-1);
     const after = text.slice(i, i + 700);
     expect(after).toContain('inPlaceMoveRef.current = null;');
@@ -168,15 +170,46 @@ describe('the overlay fallback is wired for a drag that started in place', () =>
   it('the frame builds the shift from the delta the GPU applied', () => {
     // The unit tests above exercise the passes; this is the wiring that decides
     // whether they are ever told anything.
-    const i = text.indexOf('const inPlaceShift = inPlaceMoveRef.current');
+    const i = text.indexOf('const localShift = inPlaceMoveRef.current');
     expect(i).toBeGreaterThan(-1);
     const decl = text.slice(i, i + 320);
     expect(decl).toContain('ids: dragAffectedRef.current');
-    expect(decl).toContain('dx: inPlaceMoveRef.current.x');
-    expect(decl).toContain('dy: inPlaceMoveRef.current.y');
+    expect(decl).toContain('dx: localShift.x');
+    expect(decl).toContain('dy: localShift.y');
     // `inPlaceMoveRef`, not `moveDeltaRef`: the buffer may be a frame behind
     // the cursor, and the passes must agree with the buffer, not the pointer.
     expect(decl).not.toContain('moveDeltaRef');
+  });
+});
+
+describe('a remote drag draws with the current render closure', () => {
+  it('the long-lived sync subscription never calls its captured requestDraw', () => {
+    const start = text.indexOf('const transport = createProjectSyncTransport(projectName);');
+    const end = text.indexOf('}, [projectName]);', start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const subscription = text.slice(start, end);
+    expect(subscription).toContain('requestDrawRef.current();');
+    expect(subscription).not.toMatch(/(?<!Ref\.current)requestDraw\(\);/);
+  });
+
+  it('mouse-up sends the exact final delta before committing the board', () => {
+    const comment = text.indexOf('The pointer stream is throttled');
+    const commit = text.indexOf('commitBoard(', comment);
+    expect(comment).toBeGreaterThan(-1);
+    expect(commit).toBeGreaterThan(comment);
+    const release = text.slice(comment, commit);
+    expect(release).toContain("publish({ kind: 'live-move-delta', x: delta!.x, y: delta!.y })");
+  });
+
+  it('does not repaint a receiver-local selection at the stale position', () => {
+    expect(text).toContain('const remoteSelectionConflict =');
+    expect(text).toContain(
+      'const os = moveSceneRef.current ?? (remoteSelectionConflict ? null : selSceneRef.current);',
+    );
+    expect(text).toContain(
+      'handles.length > 0 && !moveDeltaRef.current && !remoteSelectionConflict',
+    );
   });
 });
 

@@ -30,6 +30,7 @@ import {
   setBoardItemsLocked,
   allBoardItemIds,
   isBoardItemLocked,
+  subsetBoardItems,
 } from '@ziroeda/pcbnew/src/edit-board.js';
 import { parse } from '@ziroeda/sexpr/src/index.js';
 import { readBoard } from '@ziroeda/pcbnew/src/read-board.js';
@@ -45,6 +46,7 @@ import type {
   PcbTextItem,
   PcbZone,
   PcbPad,
+  PcbDimension,
 } from '@ziroeda/pcbnew/src/types.js';
 
 const EMPTY = { kind: 'list' as const, items: [] };
@@ -113,6 +115,17 @@ const text = (at: { x: number; y: number }, s: string, size = 1000): PcbTextItem
   angle: 0,
   layer: 'F.SilkS',
   size: { x: size, y: size },
+  source: EMPTY,
+});
+const dimension = (
+  start: { x: number; y: number },
+  end: { x: number; y: number },
+): PcbDimension => ({
+  kind: 'aligned',
+  layer: 'Dwgs.User',
+  start,
+  end,
+  style: { thickness: 100, arrowLength: 500, textPositionMode: 0, extensionOffset: 200 },
   source: EMPTY,
 });
 const zone = (poly: { x: number; y: number }[]): PcbZone => ({
@@ -533,6 +546,45 @@ describe('moveBoardItems', () => {
     // The track kept its net/width (only coords were patched).
     expect(reread.tracks[0]!.net).toBe(1);
     expect(reread.tracks[0]!.width).toBe(mmToIU(0.25));
+  });
+});
+
+describe('subsetBoardItems', () => {
+  it('includes only the selected item, not every item of that kind', () => {
+    const b = board({
+      tracks: [track({ x: 0, y: 0 }, { x: 100, y: 0 }), track({ x: 200, y: 0 }, { x: 300, y: 0 })],
+    });
+    const sub = subsetBoardItems(b, new Set(['track:0']));
+    expect(sub.tracks).toHaveLength(1);
+    expect(sub.tracks[0]).toBe(b.tracks[0]);
+  });
+
+  it('drops dimensions and images entirely when neither is selected', () => {
+    // A drag/move preview overlay is built from this subset (PcbEditor.tsx's
+    // moveSceneRef); before this fix, subsetBoardItems never filtered these
+    // two collections at all, so EVERY dimension and image on the board rode
+    // along with an unrelated footprint drag, translated by the same delta —
+    // "dragging a footprint drags all dimensions."
+    const b = board({
+      footprints: [footprint([])],
+      dimensions: [dimension({ x: 0, y: 0 }, { x: 1000, y: 0 })],
+      images: [],
+    });
+    const sub = subsetBoardItems(b, new Set(['footprint:0']));
+    expect(sub.dimensions).toEqual([]);
+    expect(sub.images).toEqual([]);
+  });
+
+  it('includes a selected dimension and excludes an unselected one', () => {
+    const b = board({
+      dimensions: [
+        dimension({ x: 0, y: 0 }, { x: 1000, y: 0 }),
+        dimension({ x: 2000, y: 0 }, { x: 3000, y: 0 }),
+      ],
+    });
+    const sub = subsetBoardItems(b, new Set(['dimension:1']));
+    expect(sub.dimensions).toHaveLength(1);
+    expect(sub.dimensions[0]).toBe(b.dimensions[1]);
   });
 });
 
