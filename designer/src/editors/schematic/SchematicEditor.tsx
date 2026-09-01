@@ -17,6 +17,8 @@ import {
 import { resolveActiveSheet, readSheetRef, writeSheetRefText } from '@ziroeda/common';
 import { Fragment, useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { parse } from '@ziroeda/sexpr';
+import { createProjectSyncTransport } from '../../sync/createProjectSyncTransport.js';
+import type { PresenceInfo, ProjectSyncTransport } from '../../sync/ProjectSyncTransport.js';
 import {
   type ArcEditMode,
   incrementArcEditMode,
@@ -915,6 +917,92 @@ export function SchematicEditor({
   // (a plain message, or a snapshot with the per-sheet parse gauge).
   const [loading, setLoading] = useState<string | ProgressSnapshot | null>(null);
   const [selection, setSelection] = useState<ReadonlySet<string>>(new Set());
+  // Live cross-tab presence/selection sync (designer/src/sync/). Broadcast-only
+  // for now — does not apply remote model changes yet.
+  const syncTransport = useRef<ProjectSyncTransport | null>(null);
+  const [syncPeers, setSyncPeers] = useState<PresenceInfo[]>([]);
+  // Other peers' last-known cursor world position, keyed by peerId. Cleared
+  // per-peer on their next 'presence' drop (see the presence handler below).
+  const [remoteCursors, setRemoteCursors] = useState<Map<string, Vec2>>(new Map());
+  // A remote sheet-text update waiting to be applied (see the effect near
+  // applySheetDocument below — it needs sheetInstanceRefs/applySheetDocument,
+  // both defined later in this component, hence the queue rather than
+  // applying inline here).
+  const [pendingRemoteChange, setPendingRemoteChange] = useState<{ sheetPath: string; text: string } | null>(
+    null,
+  );
+  // Last text this tab is responsible for having produced on the active
+  // sheet — set both when broadcasting a local edit and when applying a
+  // remote one, so applying a remote change doesn't immediately echo it
+  // straight back out (see the broadcast effect below).
+  const lastKnownText = useRef<string | null>(null);
+  useEffect(() => {
+    if (!projectName) return undefined;
+    const transport = createProjectSyncTransport(projectName);
+    syncTransport.current = transport;
+    transport.connect('schematic', currentPath);
+    const unsubscribe = transport.onMessage((payload, fromPeerId) => {
+      if (payload.kind === 'presence') {
+        setSyncPeers(payload.peers);
+        const stillHere = new Set(payload.peers.map((p) => p.peerId));
+        setRemoteCursors((prev) => {
+          const next = new Map(prev);
+          for (const peerId of next.keys()) if (!stillHere.has(peerId)) next.delete(peerId);
+          return next;
+        });
+      } else if (payload.kind === 'cursor') {
+        setRemoteCursors((prev) => new Map(prev).set(fromPeerId, { x: payload.x, y: payload.y }));
+      } else if (payload.kind === 'model-changed') {
+        setPendingRemoteChange({ sheetPath: payload.sheetPath, text: payload.text });
+      }
+    });
+    return () => {
+      unsubscribe();
+      transport.disconnect();
+      syncTransport.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectName]);
+  useEffect(() => {
+    syncTransport.current?.updatePresence('schematic', currentPath);
+  }, [currentPath]);
+  // Only show a peer's cursor while they're on the same sheet — a position
+  // from another sheet would land on unrelated geometry here.
+  const remoteCursorList = useMemo(
+    () =>
+      syncPeers
+        .filter((p) => p.sheetPath === currentPath && remoteCursors.has(p.peerId))
+        .map((p) => ({
+          peerId: p.peerId,
+          label: p.peerId.slice(0, 4),
+          world: remoteCursors.get(p.peerId)!,
+        })),
+    [syncPeers, remoteCursors, currentPath],
+  );
+  useEffect(() => {
+    syncTransport.current?.publish({ kind: 'selection', refs: [...selection] });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selection]);
+  // Broadcast the active sheet's edits (designer/src/sync/), debounced so a
+  // run of small edits collapses into one message instead of one per commit.
+  // Skipped when the change we're seeing is one we just applied FROM a
+  // remote peer (lastKnownText already matches it) — otherwise applying a
+  // remote change would immediately echo it straight back out.
+  useEffect(() => {
+    if (!doc) return undefined;
+    const timer = setTimeout(() => {
+      let text: string;
+      try {
+        text = serializeSchematic(doc);
+      } catch {
+        return;
+      }
+      if (text === lastKnownText.current) return;
+      lastKnownText.current = text;
+      syncTransport.current?.publish({ kind: 'model-changed', sheetPath: currentPath, text });
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [doc, currentPath]);
   /**
    * The selection a right-click made just to have something to aim the menu at
    * — `SELECTION::SetIsHover`.
@@ -1430,6 +1518,11 @@ export function SchematicEditor({
     devicePixelRatio: dpr,
     iuPerMM: SCH_IU_PER_MM,
   });
+  // Throttle cursor broadcasts (designer/src/sync/) — a raw pointermove rate
+  // would flood the channel; peers only need a position often enough to read
+  // as "live," not every frame.
+  const lastCursorBroadcast = useRef(0);
+  const CURSOR_BROADCAST_MS = 80;
   const onCursorMove = useCallback(
     (world: Vec2 | null, snapped: Vec2 | null) => {
       cursorRef.current = world;
@@ -1438,6 +1531,13 @@ export function SchematicEditor({
       // grid. Ours showed the raw pointer position, which is why the readout sat
       // on values like 110.0250 on a 1.27 mm grid.
       statusReadout.setCursor(snapped ?? world);
+      if (world) {
+        const now = Date.now();
+        if (now - lastCursorBroadcast.current >= CURSOR_BROADCAST_MS) {
+          lastCursorBroadcast.current = now;
+          syncTransport.current?.publish({ kind: 'cursor', x: world.x, y: world.y });
+        }
+      }
     },
     [statusReadout],
   );
@@ -3310,6 +3410,28 @@ export function SchematicEditor({
     },
     [applySheetCommand],
   );
+
+  // Apply a queued remote sheet-text update (designer/src/sync/). Reuses
+  // applySheetDocument, the same primitive Increment Annotations/Sync Sheet
+  // Pins use to replace a whole sheet document — so this rides the ordinary
+  // undo path when it lands on the open sheet (a bad remote update is a
+  // Ctrl+Z away) and gets its own history entry otherwise, exactly like any
+  // other cross-sheet edit. Not a merge: last update to arrive wins.
+  useEffect(() => {
+    if (!pendingRemoteChange) return;
+    const { sheetPath, text } = pendingRemoteChange;
+    setPendingRemoteChange(null);
+    const target = sheetInstanceRefs.find((r) => r.path === sheetPath);
+    if (!target) return; // not (yet) part of this tab's loaded hierarchy
+    let next: Schematic;
+    try {
+      next = { ...readSchematic(parse(text)), fileName: target.file };
+    } catch {
+      return; // malformed text mid-broadcast; wait for the next update
+    }
+    if (target.file === currentFile) lastKnownText.current = text;
+    applySheetDocument(target.file, next, 'Remote update', []);
+  }, [pendingRemoteChange, sheetInstanceRefs, currentFile, applySheetDocument]);
 
   /** Open the fields table, unless its field names have to be resolved first. */
   const openFieldsTable = useCallback(
@@ -9087,6 +9209,11 @@ export function SchematicEditor({
     >
       {/* HOTKEY_CYCLE_POPUP: a wxSTAY_ON_TOP window over the whole frame. */}
       {hotkeyPopup.node}
+      {syncPeers.length > 0 && (
+        <div className="ze-presence-badge" title={syncPeers.map((p) => `${p.view} · ${p.sheetPath ?? '/'}`).join('\n')}>
+          {syncPeers.length === 1 ? '1 other viewer' : `${syncPeers.length} other viewers`}
+        </div>
+      )}
       {copyAsOpen && (
         <SaveAsDialog
           title="Save Current Sheet Copy As"
@@ -9553,6 +9680,7 @@ export function SchematicEditor({
               onRequestChooser={() => setChooserDismissed(false)}
               onEditDrawingSheet={() => setPageSettingsOpen(true)}
               onCursorMove={onCursorMove}
+              remoteCursors={remoteCursorList}
               onScaleChange={onScaleChange}
             />
             {ctxMenu && (

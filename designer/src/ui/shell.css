@@ -16450,3 +16450,18 @@ td.ze-grid-bool {
 .ze-chat-handle:active {
   cursor: grabbing;
 }
+
+/* Cross-tab presence badge (designer/src/sync/) — no upstream KiCad
+   counterpart, KiCad has no notion of another viewer on the same document. */
+.ze-presence-badge {
+  position: fixed;
+  top: 8px;
+  right: 8px;
+  z-index: 999;
+  padding: 4px 10px;
+  border-radius: 12px;
+  background: var(--selection-bg);
+  color: var(--selection-fg);
+  font-size: 12px;
+  pointer-events: none;
+}

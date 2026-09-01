@@ -496,6 +496,8 @@ import {
   PCB_SPECIAL,
 } from './pcbTheme.js';
 import { PcbPropertiesPanel } from './PcbPropertiesPanel.js';
+import { createProjectSyncTransport } from '../../sync/createProjectSyncTransport.js';
+import type { PresenceInfo, ProjectSyncTransport } from '../../sync/ProjectSyncTransport.js';
 import {
   pcbItemFriendlyName,
   pcbPropertiesFor,
@@ -914,6 +916,11 @@ function promotePadsForCommand(
   const hadPad = [...sel].some((id) => parseBoardItemId(id)?.kind === 'pad');
   return { items, selection: hadPad ? filterSelectionForFreePads(sel) : null };
 }
+
+// Matches the schematic editor's presence badge / remote-cursor colour
+// (--selection-bg in shell.css) — no upstream KiCad counterpart, so there's
+// no COLOR4D to cite; kept as a literal because this is a raw canvas fill.
+const REMOTE_CURSOR_COLOR = '#e95420';
 
 export function PcbEditor({
   fileName,
@@ -1340,6 +1347,42 @@ export function PcbEditor({
     syncNonceRef.current += 1;
     onSyncSelectionToSch({ parts, nonce: syncNonceRef.current });
   }, [selection, onSyncSelectionToSch]);
+  // Live cross-tab presence/cursor sync (designer/src/sync/), mirroring the
+  // schematic editor's. Presence + remote cursor only for this pass — PCB
+  // edits still go through commitBoard's whole-board snapshots (50+ call
+  // sites), not a discrete command log, so there is no safe single choke
+  // point yet to hang live document sync off; see the PCB op-log refactor
+  // this is waiting on.
+  const syncTransport = useRef<ProjectSyncTransport | null>(null);
+  const [syncPeers, setSyncPeers] = useState<PresenceInfo[]>([]);
+  // Read by draw() via .current, same as cursorRef — avoids adding a state
+  // dependency to that callback's tightly-scoped deps array.
+  const remoteCursorsRef = useRef<Map<string, { x: number; y: number }>>(new Map());
+  const lastCursorBroadcast = useRef(0);
+  const CURSOR_BROADCAST_MS = 80;
+  useEffect(() => {
+    if (!projectName) return undefined;
+    const transport = createProjectSyncTransport(projectName);
+    syncTransport.current = transport;
+    transport.connect('pcb', null);
+    const unsubscribe = transport.onMessage((payload, fromPeerId) => {
+      if (payload.kind === 'presence') {
+        setSyncPeers(payload.peers);
+        const stillHere = new Set(payload.peers.map((p) => p.peerId));
+        for (const peerId of remoteCursorsRef.current.keys())
+          if (!stillHere.has(peerId)) remoteCursorsRef.current.delete(peerId);
+      } else if (payload.kind === 'cursor') {
+        remoteCursorsRef.current.set(fromPeerId, { x: payload.x, y: payload.y });
+        requestDrawRef.current();
+      }
+    });
+    return () => {
+      unsubscribe();
+      transport.disconnect();
+      syncTransport.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectName]);
   // Disambiguation menu (PCB_SELECTION_TOOL::doSelectionMenu): shown at a click
   // that hits several equally-plausible items so the user can pick one.
   const [disambig, setDisambig] = useState<{
@@ -3883,6 +3926,24 @@ export function PcbEditor({
           devicePixelRatio: dpr,
         },
       );
+    }
+    // Other viewers' cursors (designer/src/sync/) — no upstream KiCad
+    // counterpart. Same treatment as the schematic editor's: a small dot +
+    // short label at each peer's last-known world position.
+    if (remoteCursorsRef.current.size > 0) {
+      for (const [peerId, pos] of remoteCursorsRef.current) {
+        const sxp = pos.x * sx + v.tx;
+        const syp = pos.y * v.scale + v.ty;
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(sxp, syp, 4 * dpr, 0, Math.PI * 2);
+        ctx.fillStyle = REMOTE_CURSOR_COLOR;
+        ctx.fill();
+        ctx.font = `${11 * dpr}px sans-serif`;
+        ctx.fillStyle = REMOTE_CURSOR_COLOR;
+        ctx.fillText(peerId.slice(0, 4), sxp + 7 * dpr, syp - 7 * dpr);
+        ctx.restore();
+      }
     }
     notePcbPaint(useGl ? 'gl' : 'raster', __t0);
     setScale(v.scale);
@@ -8598,6 +8659,13 @@ export function PcbEditor({
       }
       // Repaint so the crosshair follows even on a plain hover (no pan/drag).
       requestDraw();
+      // Throttled cross-tab cursor broadcast (designer/src/sync/) — see the
+      // schematic editor's onCursorMove for the same rate-limiting rationale.
+      const now = Date.now();
+      if (now - lastCursorBroadcast.current >= CURSOR_BROADCAST_MS) {
+        lastCursorBroadcast.current = now;
+        syncTransport.current?.publish({ kind: 'cursor', x: wx, y: wy });
+      }
     }
     if (panRef.current) {
       const v = viewRef.current;
@@ -10268,6 +10336,14 @@ export function PcbEditor({
 
   return (
     <div className="ze-app">
+      {syncPeers.length > 0 && (
+        <div
+          className="ze-presence-badge"
+          title={syncPeers.map((p) => p.view).join('\n')}
+        >
+          {syncPeers.length === 1 ? '1 other viewer' : `${syncPeers.length} other viewers`}
+        </div>
+      )}
       <MenuBar
         menus={menus}
         leftSlot={<HomeLink onClick={closeFrame} />}

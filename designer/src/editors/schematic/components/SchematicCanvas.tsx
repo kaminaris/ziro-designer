@@ -687,6 +687,9 @@ interface Props {
   /** ERC violations to draw as KiCad marker arrows (null = ERC not run);
    *  `excluded` picks LAYER_ERC_EXCLUSION's colour (SCH_MARKER::GetColorLayer). */
   ercMarkers?: readonly (ErcViolation & { excluded?: boolean; brightened?: boolean })[] | null;
+  /** Other viewers' live cursor positions (designer/src/sync/) — no upstream
+   *  KiCad counterpart, KiCad has no notion of another viewer. World coords. */
+  remoteCursors?: readonly { peerId: string; label: string; world: Vec2 }[];
   /**
    * A click landed on an ERC marker. `SCH_MARKER_T` is "always selectable" in
    * `SCH_SELECTION_TOOL`, and selecting one cross-probes to the ERC dialog
@@ -792,6 +795,18 @@ interface Props {
 
 type Mode = 'idle' | 'pan' | 'dragzoom' | 'move' | 'box' | 'lasso';
 
+// KiCad's selection-rectangle colours for a bright background
+// (common/preview_items/selection_area.cpp, selectionColorScheme[1]).
+// Matches the presence badge's --selection-bg token (shell.css) — no upstream
+// KiCad counterpart, so there's no COLOR4D to cite; kept as a literal because
+// this is a raw canvas fill, same as the box-select colours below.
+const REMOTE_CURSOR_COLOR = '#e95420';
+const BOX_FILL_NORMAL = 'rgba(128, 77, 255, 0.5)'; // COLOR4D(0.5,0.3,1.0,0.5)
+const BOX_FILL_ADDITIVE = 'rgba(128, 255, 128, 0.5)'; // COLOR4D(0.5,1.0,0.5,0.5)
+const BOX_FILL_SUBTRACT = 'rgba(255, 128, 128, 0.5)'; // COLOR4D(1.0,0.5,0.5,0.5)
+const BOX_OUTLINE_L2R = 'rgb(179, 179, 0)'; // window select: dark yellow
+const BOX_OUTLINE_R2L = 'rgb(26, 26, 255)'; // greedy select: blue
+
 // EDIT_POINT's screen sizes come from `preview_items/edit_points.ts` now — the
 // three were declared here as 8/3/6, and 3 and 6 are the `__WXMAC__` arm of
 // `edit_points.h:196-202`. A GTK build is 2 and 5, so every handle border was
@@ -846,6 +861,7 @@ export const SchematicCanvas = forwardRef<CanvasController, Props>(function Sche
     pastePending,
     onPasteDone,
     ercMarkers,
+    remoteCursors,
     onMarkerPick,
     onCommand,
     onDropIntoSheet,
@@ -2545,6 +2561,23 @@ export const SchematicCanvas = forwardRef<CanvasController, Props>(function Sche
       ctx.setTransform(1, 0, 0, 1, 0, 0);
     }
 
+    // Other viewers' cursors (designer/src/sync/) — no upstream KiCad
+    // counterpart. A small dot + short label at each peer's last-known world
+    // position, in screen space so the label stays legible at any zoom.
+    if (remoteCursors && remoteCursors.length > 0) {
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      for (const rc of remoteCursors) {
+        const sx = rc.world.x * vp.scale + vp.offsetX;
+        const sy = rc.world.y * vp.scale + vp.offsetY;
+        ctx.beginPath();
+        ctx.arc(sx, sy, 4, 0, Math.PI * 2);
+        ctx.fillStyle = REMOTE_CURSOR_COLOR;
+        ctx.fill();
+        ctx.font = '11px sans-serif';
+        ctx.fillText(rc.label, sx + 7, sy - 7);
+      }
+    }
+
     // Box-selection rubber band, in KiCad's colours: the fill shows the mode
     // (normal/additive/subtractive) and the outline shows the direction,
     // dark yellow for a left-to-right "window", blue for right-to-left greedy.
@@ -2703,6 +2736,7 @@ export const SchematicCanvas = forwardRef<CanvasController, Props>(function Sche
     inputPrefs,
     renderOpts,
     ercMarkers,
+    remoteCursors,
     GRID,
   ]);
 
