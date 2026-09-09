@@ -30,7 +30,6 @@ import {
   setBoardItemsLocked,
   allBoardItemIds,
   isBoardItemLocked,
-  subsetBoardItems,
   boardItemUuids,
   boardIdsForUuids,
 } from '@ziroeda/pcbnew/src/edit-board.js';

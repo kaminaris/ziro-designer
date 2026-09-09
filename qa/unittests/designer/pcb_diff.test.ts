@@ -105,9 +105,9 @@ describe('diffBoard / applyBoardPatch', () => {
   });
 
   it('diffCollection distinguishes "no change" (undefined) from "unsafe" (missing uuid)', () => {
-    const withUuid = [{ uuid: 'a', v: 1 }];
-    const changedUuid = [{ uuid: 'a', v: 2 }];
-    const withoutUuid = [{ uuid: undefined, v: 1 }];
+    const withUuid: Array<{ uuid?: string; v: number }> = [{ uuid: 'a', v: 1 }];
+    const changedUuid: Array<{ uuid?: string; v: number }> = [{ uuid: 'a', v: 2 }];
+    const withoutUuid: Array<{ uuid?: string; v: number }> = [{ uuid: undefined, v: 1 }];
     expect(diffCollection(withUuid, withUuid)).toBeUndefined(); // same array, no change
     expect(diffCollection(withUuid, changedUuid)).toEqual({ upsert: changedUuid, remove: [] });
     expect(diffCollection(withoutUuid, withUuid)).toBe(UNSAFE);
