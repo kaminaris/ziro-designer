@@ -2284,6 +2284,106 @@ export function subsetBoardItems(board: Board, ids: ReadonlySet<string>): Board 
   };
 }
 
+/** Every top-level, uuid-carrying collection — the fourteen kinds a peer's
+ *  selection can resolve by uuid. `fptext`/`pad` are deliberately absent: both
+ *  are children of a footprint and carry no `uuid` of their own here, so a
+ *  peer's grab or selection of a single pad rounds up to nothing rather than
+ *  to its parent footprint — a false "not locked" is a smaller surprise than
+ *  mislabeling a pad-only selection as the whole part. */
+const UUID_KINDS: readonly BoardItemKind[] = [
+  'footprint',
+  'track',
+  'arc',
+  'via',
+  'zone',
+  'shape',
+  'text',
+  'textbox',
+  'table',
+  'image',
+  'dimension',
+  'point',
+  'barcode',
+  'group',
+];
+
+function uuidCollection(board: Board, kind: BoardItemKind): readonly { uuid?: string }[] | null {
+  switch (kind) {
+    case 'footprint':
+      return board.footprints;
+    case 'track':
+      return board.tracks;
+    case 'arc':
+      return board.arcs;
+    case 'via':
+      return board.vias;
+    case 'zone':
+      return board.zones;
+    case 'shape':
+      return board.shapes;
+    case 'text':
+      return board.texts;
+    case 'textbox':
+      return board.textBoxes;
+    case 'table':
+      return board.tables;
+    case 'image':
+      return board.images;
+    case 'dimension':
+      return board.dimensions;
+    case 'point':
+      return board.points;
+    case 'barcode':
+      return board.barcodes;
+    case 'group':
+      return board.groups;
+    case 'fptext':
+    case 'pad':
+      return null;
+  }
+}
+
+/**
+ * The uuids of `ids`, for identifying items to a PEER rather than to this
+ * tab — a `kind:index` id is only meaningful against the board that produced
+ * it, since a peer's independently-loaded copy of the same file can hold the
+ * same item at a different index after either side has inserted or removed
+ * anything. Used for live selection sync (designer/src/sync/), the same
+ * problem `pcb_diff.ts` solves for edits.
+ */
+export function boardItemUuids(board: Board, ids: ReadonlySet<string>): string[] {
+  const out: string[] = [];
+  for (const id of ids) {
+    const ref = parseBoardItemId(id);
+    if (!ref) continue;
+    const collection = uuidCollection(board, ref.kind);
+    const uuid = collection?.[ref.index]?.uuid;
+    if (uuid) out.push(uuid);
+  }
+  return out;
+}
+
+/**
+ * The inverse of {@link boardItemUuids}: this board's own `kind:index` ids
+ * for whichever of `uuids` it actually has right now. A uuid with no match
+ * — the item does not exist on this board, or existed and was since deleted
+ * — simply contributes nothing rather than erroring: a peer's selection
+ * racing a delete is exactly the kind of thing this has to degrade quietly
+ * through, since the wire has no way to tell "gone" from "never existed
+ * here" and does not need to.
+ */
+export function boardIdsForUuids(board: Board, uuids: ReadonlySet<string>): Set<string> {
+  const out = new Set<string>();
+  if (uuids.size === 0) return out;
+  for (const kind of UUID_KINDS) {
+    const collection = uuidCollection(board, kind)!;
+    collection.forEach((item, i) => {
+      if (item.uuid && uuids.has(item.uuid)) out.add(boardItemId(kind, i));
+    });
+  }
+  return out;
+}
+
 // ----- rotate (EDIT_TOOL::Rotate) ---------------------------------------------
 
 /** Normalise degrees to [0, 360). */

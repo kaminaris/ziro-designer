@@ -2,13 +2,21 @@
 // Copyright (C) 2026 ZiroEDA and contributors.
 import type {
   EditorKind,
+  PeerRole,
   PresenceInfo,
   ProjectSyncPayload,
   ProjectSyncTransport,
 } from './ProjectSyncTransport.js';
 
 type WireMessage =
-  | { type: 'hello'; peerId: string; view: EditorKind; sheetPath: string | null }
+  | {
+      type: 'hello';
+      peerId: string;
+      view: EditorKind;
+      sheetPath: string | null;
+      role: PeerRole;
+      displayName: string | null;
+    }
   | { type: 'bye'; peerId: string }
   | { type: 'relay'; peerId: string; payload: ProjectSyncPayload };
 
@@ -18,6 +26,13 @@ const DEFAULT_HEARTBEAT_MS = 4000;
 /** Evict a peer once it's been silent this long — a few missed heartbeats,
  *  not one, so a single delayed message doesn't flap the roster. */
 const STALE_MULTIPLE = 3;
+/**
+ * How long a freshly-connected peer waits for an existing peer to answer its
+ * hello before deciding nobody is there and naming itself the session's
+ * owner (see `PeerRole`). Long enough for a same-browser round trip under
+ * load, short enough that the presence UI settling is not itself noticeable.
+ */
+const DEFAULT_OWNER_ELECTION_MS = 300;
 
 /**
  * Cross-tab transport with no central process: each tab builds its own peer
@@ -38,27 +53,46 @@ export class BroadcastChannelTransport implements ProjectSyncTransport {
   >();
   protected selfView: EditorKind = 'schematic';
   protected selfSheetPath: string | null = null;
+  protected selfRole: PeerRole = 'editor';
+  protected selfDisplayName: string | null = null;
   protected heartbeat: ReturnType<typeof setInterval> | null = null;
+  protected ownerElection: ReturnType<typeof setTimeout> | null = null;
   protected readonly heartbeatMs: number;
   protected readonly staleMs: number;
+  protected readonly ownerElectionMs: number;
 
   constructor(
     protected readonly projectId: string,
     heartbeatMs = DEFAULT_HEARTBEAT_MS,
+    ownerElectionMs = DEFAULT_OWNER_ELECTION_MS,
   ) {
     this.heartbeatMs = heartbeatMs;
     this.staleMs = heartbeatMs * STALE_MULTIPLE;
+    this.ownerElectionMs = ownerElectionMs;
   }
 
-  connect(view: EditorKind, sheetPath: string | null): void {
+  connect(
+    view: EditorKind,
+    sheetPath: string | null,
+    identity: { displayName: string | null } = { displayName: null },
+  ): void {
     if (this.channel) return;
     this.selfView = view;
     this.selfSheetPath = sheetPath;
+    this.selfDisplayName = identity.displayName;
+    this.selfRole = 'editor';
     this.channel = new BroadcastChannel(`ziro-project-sync:${this.projectId}`);
     this.channel.addEventListener('message', (event: MessageEvent<WireMessage>) =>
       this.handleWireMessage(event.data),
     );
     this.broadcastHello();
+    // Provisionally 'editor' above so the first hello doesn't claim
+    // ownership before anyone has had a chance to answer it; if this
+    // window closes with the roster still empty, nobody else is here.
+    this.ownerElection = setTimeout(() => {
+      this.ownerElection = null;
+      if (this.peers.size === 0) this.setRole('owner');
+    }, this.ownerElectionMs);
     this.heartbeat = setInterval(() => {
       this.broadcastHello();
       this.sweepStalePeers();
@@ -71,11 +105,21 @@ export class BroadcastChannelTransport implements ProjectSyncTransport {
     this.broadcastHello();
   }
 
+  setRole(role: PeerRole): void {
+    this.selfRole = role;
+    this.broadcastHello();
+    for (const handler of this.handlers) handler({ kind: 'self-role', role }, this.peerId);
+  }
+
   disconnect(): void {
     if (!this.channel) return;
     if (this.heartbeat !== null) {
       clearInterval(this.heartbeat);
       this.heartbeat = null;
+    }
+    if (this.ownerElection !== null) {
+      clearTimeout(this.ownerElection);
+      this.ownerElection = null;
     }
     this.channel.postMessage({ type: 'bye', peerId: this.peerId } satisfies WireMessage);
     this.channel.close();
@@ -103,6 +147,8 @@ export class BroadcastChannelTransport implements ProjectSyncTransport {
       peerId: this.peerId,
       view: this.selfView,
       sheetPath: this.selfSheetPath,
+      role: this.selfRole,
+      displayName: this.selfDisplayName,
     } satisfies WireMessage);
   }
 
@@ -114,6 +160,8 @@ export class BroadcastChannelTransport implements ProjectSyncTransport {
         peerId: message.peerId,
         view: message.view,
         sheetPath: message.sheetPath,
+        role: message.role,
+        displayName: message.displayName,
       });
       this.lastSeen.set(message.peerId, Date.now());
       this.emitPresence();

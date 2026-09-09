@@ -18,7 +18,14 @@ import { resolveActiveSheet, readSheetRef, writeSheetRefText } from '@ziroeda/co
 import { Fragment, useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { parse } from '@ziroeda/sexpr';
 import { createProjectSyncTransport } from '../../sync/createProjectSyncTransport.js';
-import type { PresenceInfo, ProjectSyncTransport } from '../../sync/ProjectSyncTransport.js';
+import type {
+  PeerRole,
+  PresenceInfo,
+  ProjectSyncTransport,
+} from '../../sync/ProjectSyncTransport.js';
+import { PresencePanel } from '../../ui/PresencePanel.js';
+import { ReadOnlyNotice } from '../../ui/ReadOnlyNotice.js';
+import { useAuth } from '../../auth/AuthProvider.js';
 import {
   type ArcEditMode,
   incrementArcEditMode,
@@ -921,6 +928,31 @@ export function SchematicEditor({
   // for now — does not apply remote model changes yet.
   const syncTransport = useRef<ProjectSyncTransport | null>(null);
   const [syncPeers, setSyncPeers] = useState<PresenceInfo[]>([]);
+  // Real identity to announce (see PcbEditor.tsx's own copy of this comment
+  // and docs/proposals/multiplayer-architecture.md requirement 5).
+  const { session } = useAuth();
+  const myDisplayName = session?.user.email ?? null;
+  // This tab's own role in the live session — see PcbEditor.tsx's own copy
+  // of this comment and designer/src/sync/ProjectSyncTransport.ts's
+  // PeerRole. Read by runCommand/applySheetDocument to refuse a local edit
+  // from a viewer; mirrored into a ref for the same reason PcbEditor.tsx's
+  // is. No interactive-gesture-start guard here the way PcbEditor.tsx's
+  // beginMove has one: a schematic move isn't funnelled through one
+  // function the way a PCB drag is (SchematicCanvas.tsx sets `modeRef`
+  // directly at several call sites), so a viewer can still visually start
+  // dragging a symbol here — it just will not commit on drop, the same
+  // "reads fine without the extra polish" tradeoff PcbEditor.tsx's own
+  // nine non-drag guarded commands already accept.
+  const [myRole, setMyRole] = useState<PeerRole>('editor');
+  const myRoleRef = useRef<PeerRole>('editor');
+  myRoleRef.current = myRole;
+  // Marks this tab as applying a change that arrived from a peer rather
+  // than one it originated itself — checked (and always reset again
+  // immediately after, unlike PcbEditor.tsx's copy, since there is only
+  // one remote-apply call site here and no cross-render gap to bridge) so
+  // that call does not itself get refused by the viewer guard above.
+  const applyingRemoteRef = useRef(false);
+  const [presencePanelOpen, setPresencePanelOpen] = useState(false);
   // Other peers' last-known cursor world position, keyed by peerId. Cleared
   // per-peer on their next 'presence' drop (see the presence handler below).
   const [remoteCursors, setRemoteCursors] = useState<Map<string, Vec2>>(new Map());
@@ -941,7 +973,7 @@ export function SchematicEditor({
     if (!projectName) return undefined;
     const transport = createProjectSyncTransport(projectName);
     syncTransport.current = transport;
-    transport.connect('schematic', currentPath);
+    transport.connect('schematic', currentPath, { displayName: myDisplayName });
     const unsubscribe = transport.onMessage((payload, fromPeerId) => {
       if (payload.kind === 'presence') {
         setSyncPeers(payload.peers);
@@ -955,6 +987,13 @@ export function SchematicEditor({
         setRemoteCursors((prev) => new Map(prev).set(fromPeerId, { x: payload.x, y: payload.y }));
       } else if (payload.kind === 'model-changed') {
         setPendingRemoteChange({ sheetPath: payload.sheetPath, text: payload.text });
+      } else if (payload.kind === 'self-role') {
+        // Locally synthesized, not peer-authored — see PcbEditor.tsx's own
+        // copy of this branch and the payload's own doc comment.
+        setMyRole(payload.role);
+      } else if (payload.kind === 'role-assign') {
+        if (payload.toPeerId !== transport.peerId) return; // addressed to someone else
+        syncTransport.current?.setRole(payload.role);
       }
     });
     return () => {
@@ -963,7 +1002,7 @@ export function SchematicEditor({
       syncTransport.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectName]);
+  }, [projectName, myDisplayName]);
   useEffect(() => {
     syncTransport.current?.updatePresence('schematic', currentPath);
   }, [currentPath]);
@@ -2247,6 +2286,12 @@ export function SchematicEditor({
    */
   const runProject = useCallback(
     (edit: ProjectEdit, persist = false): void => {
+      // The one choke point every edit funnels through, whichever sheets it
+      // touches — see PcbEditor.tsx's own copy of this guard and
+      // designer/src/sync/ProjectSyncTransport.ts's PeerRole.
+      // applyingRemoteRef is what lets a remote update still land on a
+      // Viewer's own tab while refusing a local edit.
+      if (!applyingRemoteRef.current && myRoleRef.current === 'viewer') return;
       setDoc((d) => {
         if (!d) return d;
         const staged = new Map<string, EditCommand>();
@@ -3431,7 +3476,12 @@ export function SchematicEditor({
       return; // malformed text mid-broadcast; wait for the next update
     }
     if (target.file === currentFile) lastKnownText.current = text;
-    applySheetDocument(target.file, next, 'Remote update', []);
+    applyingRemoteRef.current = true;
+    try {
+      applySheetDocument(target.file, next, 'Remote update');
+    } finally {
+      applyingRemoteRef.current = false;
+    }
   }, [pendingRemoteChange, sheetInstanceRefs, currentFile, applySheetDocument]);
 
   /** Open the fields table, unless its field names have to be resolved first. */
@@ -9211,12 +9261,28 @@ export function SchematicEditor({
       {/* HOTKEY_CYCLE_POPUP: a wxSTAY_ON_TOP window over the whole frame. */}
       {hotkeyPopup.node}
       {syncPeers.length > 0 && (
-        <div
+        <button
+          type="button"
           className="ze-presence-badge"
           title={syncPeers.map((p) => `${p.view} · ${p.sheetPath ?? '/'}`).join('\n')}
+          onClick={() => setPresencePanelOpen((v) => !v)}
         >
           {syncPeers.length === 1 ? '1 other viewer' : `${syncPeers.length} other viewers`}
-        </div>
+        </button>
+      )}
+      {presencePanelOpen && (
+        <PresencePanel
+          me={{
+            peerId: syncTransport.current?.peerId ?? '',
+            role: myRole,
+            displayName: myDisplayName,
+          }}
+          peers={syncPeers}
+          onSetRole={(peerId, role) =>
+            syncTransport.current?.publish({ kind: 'role-assign', toPeerId: peerId, role })
+          }
+          onClose={() => setPresencePanelOpen(false)}
+        />
       )}
       {copyAsOpen && (
         <SaveAsDialog
@@ -9551,6 +9617,9 @@ export function SchematicEditor({
         <div className="ze-canvas-col">
           <div className="ze-canvas-wrap">
             {readOnlyNotice}
+            {myRole === 'viewer' && (
+              <ReadOnlyNotice message="You have view-only access to this project. Ask the owner for edit access to make changes." />
+            )}
             {/* WX_INFOBAR: the strip a tool posts an error into, dismissed with
               its ✕ or by the next successful action. */}
             {infoBar && (

@@ -1620,6 +1620,43 @@ export interface ScenePerFrameShift {
   dy: number;
 }
 
+/**
+ * The permanent counterpart to {@link ScenePerFrameShift}: fold a completed
+ * in-place move into the scene's own screen-space data instead of drawing it
+ * offset every frame.
+ *
+ * `PcbGl.moveItems` already translates the retained GPU buffer when a drag
+ * commits, so after that the only things still wrong are `anchors` and
+ * `padLabels` — the two passes `ScenePerFrameShift` exists to nudge at draw
+ * time, because neither lives in that buffer. Applying the same delta here,
+ * once, is what lets a commit skip `buildScene`'s full recompile for a plain
+ * translation: see docs/proposals/pcb-multiplayer-sync.md, "The drop still
+ * costs a full rebuild on every peer".
+ *
+ * `netLabels` and `viaNetLabels` carry no owner — nothing needed one before
+ * this — so a moved track, arc or via cannot be patched here and the caller
+ * must fall back to a full rebuild whenever the moved set is anything but
+ * whole footprints.
+ */
+export function shiftSceneInPlace(
+  scene: BoardScene,
+  ids: ReadonlySet<string>,
+  dx: number,
+  dy: number,
+): void {
+  if (ids.size === 0 || (dx === 0 && dy === 0)) return;
+  for (const a of scene.anchors) {
+    if (!ids.has(a.owner)) continue;
+    a.x += dx;
+    a.y += dy;
+  }
+  for (const label of scene.padLabels) {
+    if (!ids.has(label.owner)) continue;
+    label.at = { x: label.at.x + dx, y: label.at.y + dy };
+    for (const item of label.items) item.at = { x: item.at.x + dx, y: item.at.y + dy };
+  }
+}
+
 export interface SceneFilter {
   /** Appearance>Objects "Footprints Front/Back": hide whole footprints per side. */
   hideFrontFootprints?: boolean;

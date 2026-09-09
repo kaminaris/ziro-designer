@@ -31,6 +31,8 @@ import {
   allBoardItemIds,
   isBoardItemLocked,
   subsetBoardItems,
+  boardItemUuids,
+  boardIdsForUuids,
 } from '@ziroeda/pcbnew/src/edit-board.js';
 import { parse } from '@ziroeda/sexpr/src/index.js';
 import { readBoard } from '@ziroeda/pcbnew/src/read-board.js';
@@ -47,6 +49,9 @@ import type {
   PcbZone,
   PcbPad,
   PcbDimension,
+  PcbTextBox,
+  PcbTable,
+  PcbGroup,
 } from '@ziroeda/pcbnew/src/types.js';
 
 const EMPTY = { kind: 'list' as const, items: [] };
@@ -134,6 +139,29 @@ const zone = (poly: { x: number; y: number }[]): PcbZone => ({
   fills: [{ layer: 'F.Cu', polys: [poly] }],
   source: EMPTY,
 });
+const textBox = (start: { x: number; y: number }, end: { x: number; y: number }): PcbTextBox => ({
+  text: 'hi',
+  start,
+  end,
+  margins: { left: 0, top: 0, right: 0, bottom: 0 },
+  layer: 'F.SilkS',
+  size: { x: 1000, y: 1000 },
+  border: true,
+  source: EMPTY,
+});
+const table = (): PcbTable => ({
+  columnCount: 1,
+  layer: 'F.SilkS',
+  borderExternal: true,
+  borderHeader: true,
+  separatorRows: true,
+  separatorCols: true,
+  columnWidths: [1000],
+  rowHeights: [1000],
+  cells: [],
+  source: EMPTY,
+});
+const group = (members: string[]): PcbGroup => ({ name: 'g', members, source: EMPTY });
 
 const board = (over: Partial<Board>): Board => ({
   version: 20241229,
@@ -585,6 +613,60 @@ describe('subsetBoardItems', () => {
     const sub = subsetBoardItems(b, new Set(['dimension:1']));
     expect(sub.dimensions).toHaveLength(1);
     expect(sub.dimensions[0]).toBe(b.dimensions[1]);
+  });
+});
+
+describe('boardItemUuids / boardIdsForUuids', () => {
+  it('round-trips id -> uuid -> id through a different index order', () => {
+    // The actual case this exists for: two independently-loaded copies of
+    // the same file, one with an item inserted or removed, so the same
+    // uuid sits at a different index on each side.
+    const sender = board({
+      footprints: [
+        { ...footprint([]), uuid: 'fp-a' },
+        { ...footprint([]), uuid: 'fp-b' },
+      ],
+    });
+    const receiver = board({
+      footprints: [
+        { ...footprint([]), uuid: 'fp-b' },
+        { ...footprint([]), uuid: 'fp-c' },
+        { ...footprint([]), uuid: 'fp-a' },
+      ],
+    });
+    const uuids = boardItemUuids(sender, new Set(['footprint:1'])); // fp-b, index 1 on sender
+    expect(uuids).toEqual(['fp-b']);
+    const ids = boardIdsForUuids(receiver, new Set(uuids));
+    expect(ids).toEqual(new Set(['footprint:0'])); // fp-b is index 0 on receiver
+  });
+
+  it('resolves across all twelve BoardPatch collections, not just move-able ones', () => {
+    const b = board({
+      zones: [{ ...zone([{ x: 0, y: 0 }]), uuid: 'z1' }],
+      textBoxes: [{ ...textBox({ x: 0, y: 0 }, { x: 1, y: 1 }), uuid: 't1' }],
+      tables: [{ ...table(), uuid: 'tb1' }],
+      groups: [{ ...group([]), uuid: 'g1' }],
+    });
+    const ids = boardIdsForUuids(b, new Set(['z1', 't1', 'tb1', 'g1']));
+    expect(ids).toEqual(new Set(['zone:0', 'textbox:0', 'table:0', 'group:0']));
+  });
+
+  it('a uuid this board does not have resolves to nothing, not an error', () => {
+    const b = board({ footprints: [{ ...footprint([]), uuid: 'fp-a' }] });
+    expect(boardIdsForUuids(b, new Set(['fp-nonexistent']))).toEqual(new Set());
+  });
+
+  it('skips an item with no uuid rather than sending an id a peer cannot use', () => {
+    const b = board({ tracks: [track({ x: 0, y: 0 }, { x: 1, y: 0 })] }); // no uuid set
+    expect(boardItemUuids(b, new Set(['track:0']))).toEqual([]);
+  });
+
+  it('a pad/fptext id contributes nothing either way (no uuid of its own here)', () => {
+    const b = board({
+      footprints: [{ ...footprint([pad({ x: 0, y: 0 }, 10, 10)]), uuid: 'fp-a' }],
+    });
+    expect(boardItemUuids(b, new Set(['pad:0:0']))).toEqual([]);
+    expect(boardIdsForUuids(b, new Set(['fp-a']))).toEqual(new Set(['footprint:0']));
   });
 });
 

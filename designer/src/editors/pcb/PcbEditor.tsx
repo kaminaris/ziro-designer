@@ -113,6 +113,8 @@ import {
   connectedTrackEnds,
   boardItemId,
   subsetBoardItems,
+  boardItemUuids,
+  boardIdsForUuids,
   deleteBoardItems,
   rotateBoardItemsBy,
   duplicateBoardItems,
@@ -476,6 +478,7 @@ import {
   DEFAULT_DRAW_OPTIONS,
   DOM_PATH_FACTORY,
   selectedColor,
+  shiftSceneInPlace,
   type BoardScene,
   type PcbDrawOptions,
   type DrcMarkerDraw,
@@ -502,7 +505,15 @@ import {
 } from './pcbTheme.js';
 import { PcbPropertiesPanel } from './PcbPropertiesPanel.js';
 import { createProjectSyncTransport } from '../../sync/createProjectSyncTransport.js';
-import type { PresenceInfo, ProjectSyncTransport } from '../../sync/ProjectSyncTransport.js';
+import type {
+  PeerRole,
+  PresenceInfo,
+  ProjectSyncTransport,
+} from '../../sync/ProjectSyncTransport.js';
+import { useAuth } from '../../auth/AuthProvider.js';
+import { peerColor } from '../../sync/peerColor.js';
+import { PresencePanel } from '../../ui/PresencePanel.js';
+import { ReadOnlyNotice } from '../../ui/ReadOnlyNotice.js';
 import { serializeBoardAsync, parseBoardAsync } from '../../sync/pcb_sync_pool.js';
 import { diffBoard, applyBoardPatch, patchIsEmpty, type BoardPatch } from '../../sync/pcb_diff.js';
 import {
@@ -1018,11 +1029,6 @@ function promotePadsForCommand(
   return { items, selection: hadPad ? filterSelectionForFreePads(sel) : null };
 }
 
-// Matches the schematic editor's presence badge / remote-cursor colour
-// (--selection-bg in shell.css) — no upstream KiCad counterpart, so there's
-// no COLOR4D to cite; kept as a literal because this is a raw canvas fill.
-const REMOTE_CURSOR_COLOR = '#e95420';
-
 export function PcbEditor({
   fileName,
   text,
@@ -1456,6 +1462,23 @@ export function PcbEditor({
   // eventual real merge (rather than last-writer-wins) would require.
   const syncTransport = useRef<ProjectSyncTransport | null>(null);
   const [syncPeers, setSyncPeers] = useState<PresenceInfo[]>([]);
+  // This tab's own role in the live session (designer/src/sync/
+  // ProjectSyncTransport.ts, PeerRole) — 'owner' is decided by the
+  // transport itself (first one in), 'editor'/'viewer' can be set by the
+  // owner afterwards. Read by commitBoard and beginMove to refuse a local
+  // edit from a viewer; mirrored into a ref so those callbacks, defined
+  // once, see the current value without depending on this state.
+  const [myRole, setMyRole] = useState<PeerRole>('editor');
+  const myRoleRef = useRef<PeerRole>('editor');
+  myRoleRef.current = myRole;
+  // The real name to announce for this peer (a signed-in email today), so
+  // presence reads as a person rather than four random hex characters —
+  // requirement 5 in docs/proposals/multiplayer-architecture.md. Null when
+  // auth isn't configured or nobody is signed in; every display site falls
+  // back to the peerId-derived label exactly as before this existed.
+  const { session } = useAuth();
+  const myDisplayName = session?.user.email ?? null;
+  const [presencePanelOpen, setPresencePanelOpen] = useState(false);
   // Read by draw() via .current, same as cursorRef — avoids adding a state
   // dependency to that callback's tightly-scoped deps array.
   const remoteCursorsRef = useRef<Map<string, { x: number; y: number }>>(new Map());
@@ -1467,7 +1490,18 @@ export function PcbEditor({
   // (pcb_diff.ts); 'text' is the whole-board fallback for when a patch
   // can't be trusted (some touched item has no uuid).
   const [pendingRemoteBoard, setPendingRemoteBoard] = useState<
-    { kind: 'patch'; patch: BoardPatch } | { kind: 'text'; text: string } | null
+    | { kind: 'patch'; patch: BoardPatch }
+    | {
+        kind: 'text';
+        text: string;
+        /** True only for a join-time 'snapshot' (designer/src/sync/): unlike
+         *  a genuine 'model-changed' edit, which always applies (dropping
+         *  someone's real edit would be the opposite mistake), a snapshot is
+         *  just a catch-up courtesy and must defer to an edit this tab makes
+         *  of its own while the (off-thread, ~160ms) parse is still running. */
+        deferToLocalEdit?: boolean;
+      }
+    | null
   >(null);
   // Text this tab is responsible for having produced, for the whole-board
   // fallback path's echo suppression (same technique as the schematic
@@ -1509,19 +1543,143 @@ export function PcbEditor({
    */
   const remoteInPlaceRef = useRef<{ x: number; y: number } | null>(null);
   const remoteAffectedRef = useRef<ReadonlySet<string>>(new Set());
+  /**
+   * Each connected peer's current selection, by uuid (designer/src/sync/) —
+   * a `kind:index` id means nothing off this tab, since a peer's own board
+   * can have the same item at a different index. Resolved back to this
+   * tab's ids only where needed (the lock check, the draw pass below), not
+   * stored resolved: resolving eagerly here would go stale the moment a
+   * local edit shifts an array, since nothing would tell this map to redo it.
+   */
+  const remoteSelectionsRef = useRef<Map<string, ReadonlySet<string>>>(new Map());
+  /**
+   * The union of everything a peer currently has claimed on `brd`
+   * (designer/src/sync/): actively dragging it right now
+   * (`remoteAffectedRef`, only meaningful while `remoteLiveMoveActiveRef` is
+   * true) or merely having it selected (`remoteSelectionsRef`, by uuid,
+   * resolved against THIS board since a peer's own ids mean nothing here).
+   *
+   * Not just for `beginMove`. A peer's claim on an item is exactly as real
+   * when it gets rotated, mirrored, flipped, deleted, grouped or locked out
+   * from under them as when it gets dragged out from under them — the
+   * commands below that touch "the current selection" outright all read
+   * this the same way `beginMove` does.
+   */
+  const remoteLockedIds = (brd: Board): ReadonlySet<string> => {
+    const locked = new Set<string>(
+      remoteLiveMoveActiveRef.current ? remoteAffectedRef.current : [],
+    );
+    for (const peerSel of remoteSelectionsRef.current.values()) {
+      if (peerSel.size === 0) continue;
+      for (const id of boardIdsForUuids(brd, peerSel)) locked.add(id);
+    }
+    return locked;
+  };
+  /** Whether any of `ids` is currently claimed by a peer (see
+   *  `remoteLockedIds`) — the guard every whole-selection command below
+   *  runs before committing, so a stale claim (one already released) never
+   *  blocks anything: an empty `remoteLockedIds` short-circuits immediately. */
+  const isRemoteLocked = (brd: Board, ids: ReadonlySet<string>): boolean => {
+    const locked = remoteLockedIds(brd);
+    if (locked.size === 0) return false;
+    for (const id of ids) if (locked.has(id)) return true;
+    return false;
+  };
+  /**
+   * The peer ids this tab has already welcomed with a catch-up snapshot (or
+   * already knew about at connect). Compared against each 'presence' roster
+   * to find who is new — 'presence' carries the full roster every time, not
+   * a join/leave delta, so this tab has to do that diff itself.
+   */
+  const knownPeerIdsRef = useRef<ReadonlySet<string>>(new Set());
+  /**
+   * True once this tab has made its own local edit (designer/src/sync/,
+   * `commitBoard` sets it) — checked before accepting an incoming
+   * 'snapshot'. A peer that started editing before a slower snapshot
+   * arrived must not have that work silently overwritten by an older
+   * peer's copy; skipping the snapshot in that narrow race is the safe
+   * side to fail on, even though it means that one tab keeps whatever it
+   * loaded locally rather than the group's current state.
+   */
+  const hasLocalEditRef = useRef(false);
+  /** Set once this tab has accepted a 'snapshot', so a second one (every
+   *  existing peer independently notices the same newcomer and sends one)
+   *  is a no-op rather than a redundant full parse + commit. */
+  const receivedSnapshotRef = useRef(false);
   useEffect(() => {
     if (!projectName) return undefined;
     const transport = createProjectSyncTransport(projectName);
     syncTransport.current = transport;
-    transport.connect('pcb', null);
+    transport.connect('pcb', null, { displayName: myDisplayName });
     const unsubscribe = transport.onMessage((payload, fromPeerId) => {
       if (payload.kind === 'presence') {
         setSyncPeers(payload.peers);
         const stillHere = new Set(payload.peers.map((p) => p.peerId));
         for (const peerId of remoteCursorsRef.current.keys())
           if (!stillHere.has(peerId)) remoteCursorsRef.current.delete(peerId);
+        for (const peerId of remoteSelectionsRef.current.keys())
+          if (!stillHere.has(peerId)) remoteSelectionsRef.current.delete(peerId);
+        // Welcome anyone new (designer/src/sync/) — the requirement is that
+        // joining or reconnecting brings you up to date automatically, not
+        // that you get shown whatever your own local storage last had (see
+        // docs/proposals/multiplayer-architecture.md). 'presence' carries the
+        // full roster every time, not a join/leave delta, so the newcomer is
+        // whoever is in `stillHere` but was not in `knownPeerIdsRef` last
+        // time. Every already-connected peer notices the same newcomer
+        // independently and sends its own copy; the newcomer takes the first
+        // one it gets and ignores the rest (see 'snapshot' below).
+        const brd = boardRef.current;
+        if (brd) {
+          for (const peerId of stillHere) {
+            if (knownPeerIdsRef.current.has(peerId)) continue;
+            void serializeBoardAsync(brd)
+              .then((text) => {
+                syncTransport.current?.publish({
+                  kind: 'snapshot',
+                  toPeerId: peerId,
+                  sheetPath: 'board',
+                  text,
+                });
+              })
+              .catch(() => {});
+          }
+        }
+        knownPeerIdsRef.current = stillHere;
+      } else if (payload.kind === 'self-role') {
+        // Locally synthesized, not peer-authored — see the payload's own
+        // doc comment. Keeps this tab's own role (and therefore the
+        // commitBoard/beginMove guards below, and the presence UI) in step
+        // with the transport's own owner-election or an applied
+        // 'role-assign', neither of which React would otherwise notice.
+        setMyRole(payload.role);
+      } else if (payload.kind === 'role-assign') {
+        if (payload.toPeerId !== transport.peerId) return; // addressed to someone else
+        syncTransport.current?.setRole(payload.role);
+      } else if (payload.kind === 'snapshot') {
+        if (payload.toPeerId !== transport.peerId) return; // addressed to someone else
+        if (receivedSnapshotRef.current || hasLocalEditRef.current) return;
+        receivedSnapshotRef.current = true;
+        // Reuses the whole-board fallback path below (parse off-thread, then
+        // commitBoard) — there is no prior state here for pcb_diff.ts to
+        // diff a patch against, so whole-document text is the only shape
+        // this can take. `deferToLocalEdit` re-checks `hasLocalEditRef` right
+        // before the parse resolves, not just here: this tab could start its
+        // own edit during the ~160ms a parse takes, and that edit must not
+        // be silently overwritten by an older snapshot landing after it —
+        // still one Ctrl+Z away if that race is lost, not gone, but losing
+        // it silently at all is the thing worth avoiding.
+        setPendingRemoteBoard({ kind: 'text', text: payload.text, deferToLocalEdit: true });
       } else if (payload.kind === 'cursor') {
         remoteCursorsRef.current.set(fromPeerId, { x: payload.x, y: payload.y });
+        requestDrawRef.current();
+      } else if (payload.kind === 'selection') {
+        // A schematic tab on the same project shares this channel (it is
+        // keyed on projectId, not on editor kind), and would send its own
+        // ids here too — harmless: `boardIdsForUuids` below resolves against
+        // THIS board, and a schematic ref is not a uuid this board has, so
+        // it simply resolves to nothing.
+        if (payload.refs.length === 0) remoteSelectionsRef.current.delete(fromPeerId);
+        else remoteSelectionsRef.current.set(fromPeerId, new Set(payload.refs));
         requestDrawRef.current();
       } else if (payload.kind === 'board-patch') {
         // Clear the stale drag delta too — the commit-apply effect below
@@ -1585,6 +1743,11 @@ export function PcbEditor({
         // So: take the same in-place branch `beginMove` takes, on the same
         // conditions, and leave the overlay as the fallback it is locally.
         const affected = remoteMoveTargetIds(brd, payload.patch);
+        // Set for both branches below, not just the in-place one — this is
+        // also what `beginMove`'s lock check (below) reads to refuse a local
+        // grab of whatever a peer is actively moving, and that has to hold
+        // for the overlay-fallback path too.
+        remoteAffectedRef.current = affected;
         const gl = glRef.current;
         const inPlace =
           affected.size > 0 &&
@@ -1595,7 +1758,6 @@ export function PcbEditor({
           sceneIsGlRef.current &&
           gl.canMoveItems(affected);
         if (inPlace) {
-          remoteAffectedRef.current = affected;
           remoteInPlaceRef.current = { x: 0, y: 0 };
           // No overlay and no base rebuild: the items are moving where they
           // already are. `draw()` picks the shift up for the screen-space
@@ -1657,14 +1819,24 @@ export function PcbEditor({
       } else if (payload.kind === 'live-move-end') {
         if (!remoteLiveMoveActiveRef.current) return;
         remoteLiveMoveActiveRef.current = false;
+        if (payload.committed) {
+          // The gesture moved something real: its own 'board-patch'
+          // (debounced, arriving separately) is what actually commits it and
+          // cleans up remoteInPlaceRef/moveSceneRef, via the in-place
+          // hand-off above, when it lands. All that happens here,
+          // immediately, is dropping the lock — a peer waiting on this exact
+          // item should not sit blocked for that debounce on top of a
+          // gesture that has already finished.
+          return;
+        }
+        // Uncommitted (grabbed and released without moving, or Esc): no
+        // board-patch is coming, so the preview has to be undone right here.
         const applied = remoteInPlaceRef.current;
         remoteInPlaceRef.current = null;
         if (applied) {
-          // 'end' without a board-patch behind it means the gesture produced
-          // no move (grabbed and released, or Esc), so the items belong back
-          // where they started. Shifting the buffer back is the exact inverse
-          // of what got them here — no rebuild, same as `cancelMove` does for
-          // a local in-place drag.
+          // Shifting the buffer back is the exact inverse of what got it
+          // here — no rebuild, same as `cancelMove` does for a local
+          // in-place drag.
           if (applied.x !== 0 || applied.y !== 0)
             glRef.current?.moveItems(remoteAffectedRef.current, -applied.x, -applied.y);
           remoteAffectedRef.current = new Set();
@@ -1673,7 +1845,7 @@ export function PcbEditor({
         }
         moveSceneRef.current = null;
         moveDeltaRef.current = null;
-        // The overlay fallback's zero-delta case: no board-patch follows to
+        // The overlay fallback's uncommitted case: no board-patch follows to
         // rebuild sceneRef.current, so the items pulled out at
         // live-move-start have to go back in explicitly here.
         const brd = boardRef.current;
@@ -1690,7 +1862,7 @@ export function PcbEditor({
       syncTransport.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectName]);
+  }, [projectName, myDisplayName]);
   // Broadcast board edits (designer/src/sync/), debounced so a run of small
   // edits collapses into one message. Prefers the compact uuid-keyed diff
   // (pcb_diff.ts) — a moved footprint or a shoved trace is then a handful of
@@ -1742,6 +1914,19 @@ export function PcbEditor({
       clearTimeout(timer);
     };
   }, [board]);
+  // Broadcast this tab's selection (designer/src/sync/), by uuid rather than
+  // by the `kind:index` ids `selection` actually holds — those are only
+  // meaningful against this tab's own board (see `boardItemUuids`), and a
+  // peer resolves them back with `boardIdsForUuids` against its own. Read by
+  // `beginMove`'s lock check (below) and the remote-selection draw pass.
+  // Not debounced: unlike a board edit this has no expensive work behind it,
+  // and a lock that lags the actual click is worse than one extra message.
+  useEffect(() => {
+    const brd = boardRef.current;
+    if (!brd) return;
+    syncTransport.current?.publish({ kind: 'selection', refs: boardItemUuids(brd, selection) });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selection]);
   // Disambiguation menu (PCB_SELECTION_TOOL::doSelectionMenu): shown at a click
   // that hits several equally-plausible items so the user can pick one.
   const [disambig, setDisambig] = useState<{
@@ -4309,6 +4494,69 @@ export function PcbEditor({
         },
       );
     }
+    // Other viewers' selections (designer/src/sync/) — no upstream KiCad
+    // counterpart. A dashed box, not a brightened redraw like this tab's own
+    // selection (`selSceneRef`): the two need to read as different things at
+    // a glance, this one meaning "someone else has this," not "you do."
+    //
+    // Excludes whatever `remoteAffectedRef` currently names while it is not
+    // yet safe to trust `boardRef` for those ids: that item's box would be
+    // computed from `boardRef`'s still-pre-drag position (nothing here
+    // shifts it the way `moveItems` shifts the GPU buffer), so it would
+    // visibly lag the part actually sliding across the screen — and land
+    // AT that stale position, not just late, for anyone watching.
+    //
+    // Not just `remoteLiveMoveActiveRef`: that flag drops the instant
+    // `live-move-end` arrives (deliberately — it is what releases the lock
+    // promptly, see "The lock outlived its own gesture"), but for a
+    // *committed* drag `boardRef` itself does not catch up until the
+    // debounced `board-patch` lands moments later, through the in-place
+    // hand-off that finally clears `remoteInPlaceRef`. Excluding only while
+    // the flag is true reappeared the box at the stale position for exactly
+    // that gap, then snapped it once the patch arrived — worse than staying
+    // hidden a little longer, since the earlier gap is wrong, not just late.
+    //
+    // Nor is `remoteInPlaceRef` the whole story: when the receiver's GL
+    // can't address the moved items, it takes the overlay-fallback branch
+    // instead (no WebGL2, a lost/blocked context, a reference image) —
+    // `remoteInPlaceRef` stays null for that gesture from the start, so the
+    // gap above reopens between `live-move-end` and the fallback's own
+    // deferred double-rAF commit. `moveSceneRef` is set for exactly that
+    // window (it is what the overlay itself paints from, cleared only once
+    // the commit lands), so it closes the same gap for that path.
+    if (remoteSelectionsRef.current.size > 0) {
+      const brd = boardRef.current;
+      if (brd) {
+        const dragging =
+          remoteLiveMoveActiveRef.current ||
+          remoteInPlaceRef.current !== null ||
+          moveSceneRef.current !== null
+            ? remoteAffectedRef.current
+            : null;
+        for (const [peerId, uuids] of remoteSelectionsRef.current) {
+          if (uuids.size === 0) continue;
+          const ids = boardIdsForUuids(brd, uuids);
+          if (dragging) for (const id of dragging) ids.delete(id);
+          const bb = boardSelectionBBox(brd, ids);
+          if (!bb) continue;
+          const x0 = bb.minX * sx + v.tx;
+          const y0 = bb.minY * v.scale + v.ty;
+          const x1 = bb.maxX * sx + v.tx;
+          const y1 = bb.maxY * v.scale + v.ty;
+          const color = peerColor(peerId);
+          ctx.save();
+          ctx.strokeStyle = color;
+          ctx.lineWidth = dpr;
+          ctx.setLineDash([4 * dpr, 3 * dpr]);
+          ctx.strokeRect(Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0));
+          ctx.setLineDash([]);
+          ctx.font = `${11 * dpr}px sans-serif`;
+          ctx.fillStyle = color;
+          ctx.fillText(peerId.slice(0, 4), Math.min(x0, x1), Math.min(y0, y1) - 4 * dpr);
+          ctx.restore();
+        }
+      }
+    }
     // Other viewers' cursors (designer/src/sync/) — no upstream KiCad
     // counterpart. Same treatment as the schematic editor's: a small dot +
     // short label at each peer's last-known world position.
@@ -4316,13 +4564,14 @@ export function PcbEditor({
       for (const [peerId, pos] of remoteCursorsRef.current) {
         const sxp = pos.x * sx + v.tx;
         const syp = pos.y * v.scale + v.ty;
+        const color = peerColor(peerId);
         ctx.save();
         ctx.beginPath();
         ctx.arc(sxp, syp, 4 * dpr, 0, Math.PI * 2);
-        ctx.fillStyle = REMOTE_CURSOR_COLOR;
+        ctx.fillStyle = color;
         ctx.fill();
         ctx.font = `${11 * dpr}px sans-serif`;
-        ctx.fillStyle = REMOTE_CURSOR_COLOR;
+        ctx.fillStyle = color;
         ctx.fillText(peerId.slice(0, 4), sxp + 7 * dpr, syp - 7 * dpr);
         ctx.restore();
       }
@@ -4564,10 +4813,40 @@ export function PcbEditor({
    * `skipTeardrops` is upstream's SKIP_TEARDROPS flag: the teardrop commands
    * have already built the zones they want, and re-running here would be
    * redundant work on a board that just did it.
+   *
+   * `inPlaceShift`, when given, names a pure translation already applied to
+   * the retained GPU buffer (a plain Move, local or a remote hand-off) — see
+   * `shiftSceneInPlace`. It lets this skip `buildBoardScene`'s full recompile
+   * and instead fold the same delta into the scene's own screen-space data,
+   * as long as teardrops don't also need refreshing (a teardrop pass can add
+   * or reshape geometry `moveItems` never touched, so that case still goes
+   * through the ordinary rebuild).
+   *
+   * A viewer's own edits are refused right here (designer/src/sync/
+   * ProjectSyncTransport.ts, `PeerRole`) — the single choke point every
+   * local edit already goes through is also the one place this needs
+   * saying once. `applyingRemoteRef` is what tells a viewer's own refusal
+   * apart from someone else's edit arriving over the wire: a viewer must
+   * still see the board change under people who can edit it, just never
+   * originate a change of its own.
    */
   const commitBoard = useCallback(
-    (next: Board, opts: { skipTeardrops?: boolean } = {}) => {
+    (
+      next: Board,
+      opts: {
+        skipTeardrops?: boolean;
+        inPlaceShift?: { ids: ReadonlySet<string>; dx: number; dy: number };
+      } = {},
+    ) => {
+      if (!applyingRemoteRef.current && myRoleRef.current === 'viewer') return;
       const prev = boardRef.current;
+      // Marks this tab as having its own work in flight (designer/src/sync/)
+      // — checked before accepting a join-time 'snapshot' from a peer, so a
+      // slow catch-up packet cannot silently overwrite an edit made in the
+      // meantime. `applyingRemoteRef` is set by every remote-apply call site
+      // just before it calls commitBoard, so it is already true here for
+      // exactly the commits this flag must NOT count as local.
+      if (!applyingRemoteRef.current) hasLocalEditRef.current = true;
       if (prev) undoRef.current.push(prev);
       redoRef.current = [];
       setDirty(true);
@@ -4576,9 +4855,36 @@ export function PcbEditor({
         boardHasTeardrops(next) &&
         (!prev || teardropInputsChanged(prev, next));
 
+      if (opts.inPlaceShift && !refresh && sceneRef.current) {
+        const { ids, dx, dy } = opts.inPlaceShift;
+        // Same reason `rebuildScene` bumps this first: supersede any base
+        // rebuild a prior overlay-fallback drag or patch left pending, so it
+        // cannot land later and stomp the scene this just patched.
+        baseRebuildRef.current++;
+        boardRef.current = next;
+        setBoard(next);
+        shiftSceneInPlace(sceneRef.current, ids, dx, dy);
+        const moved = boardSelectionBBox(next, ids);
+        if (moved) {
+          const b = sceneRef.current.bbox;
+          sceneRef.current.bbox = b
+            ? {
+                minX: Math.min(b.minX, moved.minX),
+                minY: Math.min(b.minY, moved.minY),
+                maxX: Math.max(b.maxX, moved.maxX),
+                maxY: Math.max(b.maxY, moved.maxY),
+              }
+            : moved;
+        }
+        rebuildSelScene();
+        sceneDirtyRef.current = true;
+        requestDraw();
+        return;
+      }
+
       setBoardModel(refresh ? applyTeardrops(next, { list: teardropListRef.current() }) : next);
     },
-    [setBoardModel],
+    [setBoardModel, requestDraw, rebuildSelScene],
   );
 
   // Apply a queued remote board update (designer/src/sync/). Reuses
@@ -4604,10 +4910,22 @@ export function PcbEditor({
       // mirror of the one at its start. Commit straight away and let the
       // rebuild swap the translated buffer for a freshly recorded one.
       if (remoteInPlaceRef.current) {
+        const shift = remoteInPlaceRef.current;
+        const shiftIds = remoteAffectedRef.current;
         remoteInPlaceRef.current = null;
         remoteAffectedRef.current = new Set();
         applyingRemoteRef.current = true;
-        commitBoard(next);
+        // Same restriction as a local plain Move (`commitMove`): only a
+        // whole-footprint set has owners `shiftSceneInPlace` can patch, so a
+        // moved track, arc or via still falls back to the ordinary rebuild.
+        const inPlaceEligible =
+          shiftIds.size > 0 && [...shiftIds].every((id) => id.startsWith('footprint:'));
+        commitBoard(
+          next,
+          inPlaceEligible
+            ? { inPlaceShift: { ids: shiftIds, dx: shift.x, dy: shift.y } }
+            : undefined,
+        );
         return;
       }
 
@@ -4674,17 +4992,30 @@ export function PcbEditor({
           // synchronously by the time commitBoard returns, so the overlay can
           // come off immediately — no gap where neither is showing.
           moveSceneRef.current = null;
+          // Whatever gesture named these ids has certainly concluded by the
+          // time ANY board-patch lands after it (this is the overlay-fallback
+          // path; the in-place hand-off above does the equivalent clear on
+          // its own branch) — stale ids left here would otherwise leak into
+          // a *later*, unrelated peer selection's box-exclusion check.
+          remoteAffectedRef.current = new Set();
           requestDraw();
         });
       });
       return;
     }
     const text = pending.text;
+    const deferToLocalEdit = pending.deferToLocalEdit ?? false;
     // Off the main thread (pcb_sync_pool.ts) — parse+readBoard measured
     // ~160ms synchronous on GigaMicroEPCV2, which is exactly the kind of
     // main-thread stall that made a local in-progress edit look corrupted.
     void parseBoardAsync(text)
       .then((next) => {
+        // Only for a join-time snapshot (see the flag's own doc comment) —
+        // a genuine remote edit ('model-changed') still always applies here,
+        // the same as any other last-write-wins commit; dropping someone
+        // else's real edit because of a local race would be the opposite
+        // mistake, and worse.
+        if (deferToLocalEdit && hasLocalEditRef.current) return;
         lastKnownBoardText.current = text;
         applyingRemoteRef.current = true;
         commitBoard(next);
@@ -4860,6 +5191,7 @@ export function PcbEditor({
     // no bell to ring here, so the command simply does nothing.
     const items = filterSelectionForDelete(new Set([...sel, ...expandGroupIds(brd, sel)]));
     if (!items) return;
+    if (isRemoteLocked(brd, items)) return; // designer/src/sync/ — a peer's claim
     commitBoard(deleteBoardItems(brd, items));
     setSelection(new Set());
   }, [commitBoard]);
@@ -4908,6 +5240,7 @@ export function PcbEditor({
       const sel = selForDrawRef.current;
       if (!brd || sel.size === 0) return;
       const { items, selection } = promotePadsForCommand(brd, sel);
+      if (isRemoteLocked(brd, items)) return; // designer/src/sync/ — a peer's claim
       if (selection) setSelection(selection);
       // `EDIT_TOOL::Rotate`: `rotateAngle = TOOL_EVT_UTILS::GetEventRotationAngle(
       // *frame(), aEvent )`, which is `frame->GetRotationAngle()` — Preferences
@@ -4928,6 +5261,7 @@ export function PcbEditor({
       const sel = selForDrawRef.current;
       if (!brd || sel.size === 0) return;
       const { items, selection } = promotePadsForCommand(brd, sel);
+      if (isRemoteLocked(brd, items)) return; // designer/src/sync/ — a peer's claim
       if (selection) setSelection(selection);
       commitBoard(mirrorBoardItems(brd, items, direction, modPoint(brd, items)));
     },
@@ -4941,6 +5275,7 @@ export function PcbEditor({
     // ACTIONS::group is enabled only for >= 2 selected items (GROUP_TOOL::update
     // -> Enable( group, selectionCount >= 2 )); grouping a lone item is a no-op.
     if (!brd || sel.size < 2) return;
+    if (isRemoteLocked(brd, sel)) return; // designer/src/sync/ — a peer's claim
     const { board: next, id } = groupBoardItems(brd, sel);
     if (!id) return;
     commitBoard(next);
@@ -4950,6 +5285,7 @@ export function PcbEditor({
     const brd = boardRef.current;
     const sel = selForDrawRef.current;
     if (!brd || sel.size === 0) return;
+    if (isRemoteLocked(brd, sel)) return; // designer/src/sync/ — a peer's claim
     // The members stay selected after dissolving their group, like KiCad.
     const members = expandGroupIds(brd, sel);
     commitBoard(ungroupBoardItems(brd, sel));
@@ -4961,6 +5297,7 @@ export function PcbEditor({
     const brd = boardRef.current;
     const sel = selForDrawRef.current;
     if (!brd || sel.size === 0) return;
+    if (isRemoteLocked(brd, sel)) return; // designer/src/sync/ — a peer's claim
     const next = addToGroupItems(brd, sel);
     if (next === brd) return;
     const gid = [...sel].find((id) => parseBoardItemId(id)?.kind === 'group');
@@ -4972,6 +5309,7 @@ export function PcbEditor({
     const brd = boardRef.current;
     const sel = selForDrawRef.current;
     if (!brd || sel.size === 0) return;
+    if (isRemoteLocked(brd, sel)) return; // designer/src/sync/ — a peer's claim
     const next = removeFromGroupItems(brd, sel);
     if (next === brd) return;
     commitBoard(next);
@@ -5003,6 +5341,7 @@ export function PcbEditor({
       const brd = boardRef.current;
       const sel = selForDrawRef.current;
       if (!brd || sel.size === 0) return;
+      if (isRemoteLocked(brd, sel)) return; // designer/src/sync/ — a peer's claim
       commitBoard(setBoardItemsLocked(brd, sel, locked));
     },
     [commitBoard],
@@ -8090,11 +8429,31 @@ export function PcbEditor({
   ): void => {
     const brd = boardRef.current;
     if (!brd || sel0.size === 0) return;
+    // A viewer's own commit is already refused in commitBoard (the choke
+    // point every one of these guarded commands eventually reaches), but
+    // catching it here too means a viewer never sees the part follow their
+    // cursor only to silently snap back on drop — refused up front instead,
+    // the same as a real lock collision below. Not extended to every other
+    // isRemoteLocked call site in this file: those are single-key commands
+    // that just silently do nothing either way, which reads fine without
+    // this, unlike an interactive drag.
+    if (myRoleRef.current === 'viewer') return;
     // A grabbed group moves as its members (the move commands know items only),
     // and a grabbed pad moves its whole footprint, EDIT_TOOL::doMoveSelection
     // runs FilterCollectorForHierarchy then FilterCollectorForFreePads over the
     // selection before it moves anything.
     const { items: sel, selection } = promotePadsForCommand(brd, sel0);
+    // Refuse the gesture rather than start it (designer/src/sync/) if it
+    // touches anything a peer has claimed — see `remoteLockedIds`, above.
+    // This is the collision live sync cannot paper over: two tabs each
+    // committing a different final position for the same item, with
+    // whichever `board-patch` lands second silently winning.
+    //
+    // Deliberately whole-gesture, not per-item: a partial grab that silently
+    // leaves out the locked members would move a *different* selection than
+    // the one the user thinks they grabbed, which is its own kind of
+    // surprise.
+    if (isRemoteLocked(brd, sel)) return;
     movingSelRef.current = sel;
     if (selection) setSelection(selection);
     moveKindRef.current = kind;
@@ -8452,6 +8811,7 @@ export function PcbEditor({
     const brd = boardRef.current;
     const sel = selForDrawRef.current;
     if (!brd || sel.size === 0) return;
+    if (isRemoteLocked(brd, sel)) return; // designer/src/sync/ — a peer's claim
     const next = flipBoardItems(brd, sel);
     if (next !== brd) commitBoard(next);
   }, [commitBoard]);
@@ -8777,6 +9137,10 @@ export function PcbEditor({
     const sel = movingSelRef.current;
     const hadOverlay =
       moveSceneRef.current !== null || dragModeRef.current || inPlaceMoveRef.current !== null;
+    // Captured before the reset below: whether this gesture's GPU buffer is
+    // already showing the drop position, which is what lets the commit below
+    // skip the full scene rebuild (see `commitBoard`'s `inPlaceShift`).
+    const wasInPlace = inPlaceMoveRef.current !== null;
     inPlaceMoveRef.current = null;
     localRatsRef.current = null;
     // `drc_on_move->ClearConflicts( view )` (:1493): the gesture is over, so
@@ -8822,20 +9186,30 @@ export function PcbEditor({
       if (liveMoveActiveRef.current) {
         syncTransport.current?.publish({ kind: 'live-move-delta', x: delta!.x, y: delta!.y });
       }
+      // Only a plain Move's own GPU buffer is guaranteed to already hold the
+      // drop position, and only for a whole-footprint selection — a track,
+      // arc or via net label carries no owner to patch (`shiftSceneInPlace`),
+      // so anything else still takes the full rebuild below.
+      const inPlaceEligible =
+        wasInPlace && kind !== 'drag' && [...sel].every((id) => id.startsWith('footprint:'));
       commitBoard(
         kind === 'drag' ? dragBoardItems(brd, sel, delta!) : moveBoardItems(brd, sel, delta!),
+        inPlaceEligible ? { inPlaceShift: { ids: sel, dx: delta!.x, dy: delta!.y } } : undefined,
       );
     } else if (hadOverlay && brd) {
       rebuildScene(brd);
     }
     if (liveMoveActiveRef.current) {
       liveMoveActiveRef.current = false;
-      // Only for the zero-delta ("clicked, didn't move") case: a real move's
-      // own board-patch (debounced, ~400ms out) already replaces the preview
-      // overlay with the committed one when it lands — sending 'end' here
-      // too would clear it early and flash the pre-drag position for that
-      // gap before the real update arrives.
-      if (!hadRealMove) syncTransport.current?.publish({ kind: 'live-move-end' });
+      // Always — this is what releases the lock (designer/src/sync/;
+      // `beginMove`'s guard) on the instant the gesture ends, rather than
+      // making a peer wait out the debounced 'board-patch' behind a real
+      // move on top of the gesture that already finished. `committed`
+      // tells the receiver whether to also undo the preview itself (see
+      // ProjectSyncPayload's doc comment): only for the uncommitted case,
+      // since a committed move's own 'board-patch' does that part when it
+      // lands, through the same in-place hand-off.
+      syncTransport.current?.publish({ kind: 'live-move-end', committed: hadRealMove });
     }
   };
 
@@ -8844,7 +9218,7 @@ export function PcbEditor({
     const brd = boardRef.current;
     if (liveMoveActiveRef.current) {
       liveMoveActiveRef.current = false;
-      syncTransport.current?.publish({ kind: 'live-move-end' });
+      syncTransport.current?.publish({ kind: 'live-move-end', committed: false });
     }
     trackDragRef.current = null;
     restoreDragHighlight();
@@ -10901,9 +11275,27 @@ export function PcbEditor({
   return (
     <div className="ze-app">
       {syncPeers.length > 0 && (
-        <div className="ze-presence-badge" title={syncPeers.map((p) => p.view).join('\n')}>
+        <button
+          type="button"
+          className="ze-presence-badge"
+          onClick={() => setPresencePanelOpen((v) => !v)}
+        >
           {syncPeers.length === 1 ? '1 other viewer' : `${syncPeers.length} other viewers`}
-        </div>
+        </button>
+      )}
+      {presencePanelOpen && (
+        <PresencePanel
+          me={{
+            peerId: syncTransport.current?.peerId ?? '',
+            role: myRole,
+            displayName: myDisplayName,
+          }}
+          peers={syncPeers}
+          onSetRole={(peerId, role) =>
+            syncTransport.current?.publish({ kind: 'role-assign', toPeerId: peerId, role })
+          }
+          onClose={() => setPresencePanelOpen(false)}
+        />
       )}
       <MenuBar
         menus={menus}
@@ -11181,6 +11573,9 @@ export function PcbEditor({
             ref={wrapRef}
             style={{ position: 'relative', flex: 1, minHeight: 0 }}
           >
+            {myRole === 'viewer' && (
+              <ReadOnlyNotice message="You have view-only access to this project. Ask the owner for edit access to make changes." />
+            )}
             <canvas
               ref={canvasRef}
               style={{

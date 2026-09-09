@@ -81,6 +81,8 @@ export {
   setFootprintLocked,
   setFootprintOrientation,
   subsetBoardItems,
+  boardItemUuids,
+  boardIdsForUuids,
   deleteBoardItems,
   addBoardShape,
   addBoardTrack,

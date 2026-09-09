@@ -128,4 +128,126 @@ describe('BroadcastChannelTransport', () => {
     expect(aPeerLists[aPeerLists.length - 1]).not.toContain(b.peerId);
     a.disconnect();
   });
+
+  it('carries the announced display name in presence', async () => {
+    const a = new BroadcastChannelTransport('proj-5');
+    const b = new BroadcastChannelTransport('proj-5');
+    const bPeers: string[] = [];
+    b.onMessage((p) => {
+      if (p.kind === 'presence') {
+        const you = p.peers.find((x) => x.peerId === a.peerId);
+        if (you) bPeers.push(you.displayName ?? '');
+      }
+    });
+
+    a.connect('schematic', null, { displayName: 'alex@example.com' });
+    b.connect('schematic', null);
+
+    await waitFor(() => bPeers.includes('alex@example.com'));
+    expect(bPeers).toContain('alex@example.com');
+
+    a.disconnect();
+    b.disconnect();
+  });
+
+  describe('PeerRole: the first one in owns the session', () => {
+    it('names itself owner if the election window closes with nobody else around', async () => {
+      const a = new BroadcastChannelTransport('proj-owner-1', undefined, 20);
+      const selfRoles: string[] = [];
+      a.onMessage((p) => {
+        if (p.kind === 'self-role') selfRoles.push(p.role);
+      });
+
+      a.connect('schematic', null);
+      await waitFor(() => selfRoles.includes('owner'));
+
+      expect(selfRoles).toEqual(['owner']);
+      a.disconnect();
+    });
+
+    it('stays editor when it joins a session someone else is already in', async () => {
+      const a = new BroadcastChannelTransport('proj-owner-2', undefined, 20);
+      const b = new BroadcastChannelTransport('proj-owner-2', undefined, 20);
+      const aSelfRoles: string[] = [];
+      const bSelfRoles: string[] = [];
+      const bPeerRoles: string[][] = [];
+      a.onMessage((p) => {
+        if (p.kind === 'self-role') aSelfRoles.push(p.role);
+      });
+      b.onMessage((p) => {
+        if (p.kind === 'self-role') bSelfRoles.push(p.role);
+        if (p.kind === 'presence') bPeerRoles.push(p.peers.map((x) => x.role));
+      });
+
+      a.connect('schematic', null);
+      await waitFor(() => aSelfRoles.includes('owner')); // a is alone first, becomes owner
+      b.connect('schematic', null);
+      await waitFor(() => bPeerRoles.some((r) => r.includes('owner')));
+
+      // Give b's own election window a chance to fire too, then confirm it
+      // never claims ownership for itself — a was already here.
+      await new Promise((r) => setTimeout(r, 40));
+      expect(aSelfRoles).toEqual(['owner']); // never re-elected once decided
+      expect(bSelfRoles).toEqual([]); // b never elects itself, a got there first
+      a.disconnect();
+      b.disconnect();
+    });
+  });
+
+  describe('role-assign: the owner moving someone between editor and viewer', () => {
+    it('applies only when addressed to this peer, and announces the new role', async () => {
+      const a = new BroadcastChannelTransport('proj-role-1');
+      const b = new BroadcastChannelTransport('proj-role-1');
+      const bSelfRoles: string[] = [];
+      const aSeesBRole: string[] = [];
+      b.onMessage((p) => {
+        if (p.kind === 'role-assign' && p.toPeerId === b.peerId) b.setRole(p.role);
+        if (p.kind === 'self-role') bSelfRoles.push(p.role);
+      });
+      a.onMessage((p) => {
+        if (p.kind === 'presence') {
+          const bEntry = p.peers.find((x) => x.peerId === b.peerId);
+          if (bEntry) aSeesBRole.push(bEntry.role);
+        }
+      });
+
+      a.connect('schematic', null);
+      b.connect('schematic', null);
+      await waitFor(() => aSeesBRole.length > 0);
+
+      a.publish({ kind: 'role-assign', toPeerId: b.peerId, role: 'viewer' });
+      await waitFor(() => bSelfRoles.includes('viewer'));
+      await waitFor(() => aSeesBRole[aSeesBRole.length - 1] === 'viewer');
+
+      expect(bSelfRoles).toContain('viewer');
+      expect(aSeesBRole[aSeesBRole.length - 1]).toBe('viewer');
+
+      a.disconnect();
+      b.disconnect();
+    });
+
+    it('is ignored by a peer it is not addressed to', async () => {
+      const a = new BroadcastChannelTransport('proj-role-2');
+      const b = new BroadcastChannelTransport('proj-role-2');
+      const c = new BroadcastChannelTransport('proj-role-2');
+      const cSelfRoles: string[] = [];
+      c.onMessage((p) => {
+        if (p.kind === 'role-assign' && p.toPeerId === c.peerId) c.setRole(p.role);
+        if (p.kind === 'self-role') cSelfRoles.push(p.role);
+      });
+
+      a.connect('schematic', null);
+      b.connect('schematic', null);
+      c.connect('schematic', null);
+      await new Promise((r) => setTimeout(r, 60));
+
+      a.publish({ kind: 'role-assign', toPeerId: b.peerId, role: 'viewer' });
+      await new Promise((r) => setTimeout(r, 60));
+
+      expect(cSelfRoles).toEqual([]); // never addressed to c, never applied
+      a.disconnect();
+      b.disconnect();
+      c.disconnect();
+    });
+  });
 });

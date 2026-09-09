@@ -257,6 +257,7 @@ import { applyCanvasSize, backingSizeFor } from '../../../ui/canvas_size.js';
 import { kiCursor } from '../../../ui/kicursors.js';
 import { remapEvent } from '../hotkey_bindings.js';
 import { settings } from '../../../prefs/settings.js';
+import { peerColor } from '../../../sync/peerColor.js';
 import type { InputPrefs } from '../../../ui/view_controls.js';
 import {
   drawGrid,
@@ -794,18 +795,6 @@ interface Props {
 }
 
 type Mode = 'idle' | 'pan' | 'dragzoom' | 'move' | 'box' | 'lasso';
-
-// KiCad's selection-rectangle colours for a bright background
-// (common/preview_items/selection_area.cpp, selectionColorScheme[1]).
-// Matches the presence badge's --selection-bg token (shell.css) — no upstream
-// KiCad counterpart, so there's no COLOR4D to cite; kept as a literal because
-// this is a raw canvas fill, same as the box-select colours below.
-const REMOTE_CURSOR_COLOR = '#e95420';
-const BOX_FILL_NORMAL = 'rgba(128, 77, 255, 0.5)'; // COLOR4D(0.5,0.3,1.0,0.5)
-const BOX_FILL_ADDITIVE = 'rgba(128, 255, 128, 0.5)'; // COLOR4D(0.5,1.0,0.5,0.5)
-const BOX_FILL_SUBTRACT = 'rgba(255, 128, 128, 0.5)'; // COLOR4D(1.0,0.5,0.5,0.5)
-const BOX_OUTLINE_L2R = 'rgb(179, 179, 0)'; // window select: dark yellow
-const BOX_OUTLINE_R2L = 'rgb(26, 26, 255)'; // greedy select: blue
 
 // EDIT_POINT's screen sizes come from `preview_items/edit_points.ts` now — the
 // three were declared here as 8/3/6, and 3 and 6 are the `__WXMAC__` arm of
@@ -2571,7 +2560,7 @@ export const SchematicCanvas = forwardRef<CanvasController, Props>(function Sche
         const sy = rc.world.y * vp.scale + vp.offsetY;
         ctx.beginPath();
         ctx.arc(sx, sy, 4, 0, Math.PI * 2);
-        ctx.fillStyle = REMOTE_CURSOR_COLOR;
+        ctx.fillStyle = peerColor(rc.peerId);
         ctx.fill();
         ctx.font = '11px sans-serif';
         ctx.fillText(rc.label, sx + 7, sy - 7);

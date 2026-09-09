@@ -237,7 +237,7 @@ const BASELINE: Record<string, { colours: number; metrics: number }> = {
   // `borderRadius: 4`, `padding: 12`, `width: 340` and three inline gaps and
   // margins. Four colours and six metrics went with the div, and nothing
   // replaced them: `DialogCopperZones` was already there.
-  'editors/pcb': { colours: 38, metrics: 200 },
+  'editors/pcb': { colours: 37, metrics: 200 },
   // At zero, and listed rather than absent: `prefs/` is the settings store, and
   // the one literal it had - the 3D viewer's `rgb(0,255,0)` selection colour -
   // is `PARAM<COLOR4D>( "render.opengl_selection_color", …, COLOR4D( 0, 1, 0, 1 ) )`
@@ -313,7 +313,7 @@ const BASELINE: Record<string, { colours: number; metrics: number }> = {
   // (`ui/DialogTableProperties.tsx`), and its layout went from twenty inline
   // `style={{ … }}` objects to rules in the stylesheet. The six that left this
   // area are the ones eeschema's copy stated inline.
-  'editors/schematic': { colours: 32, metrics: 185 },
+  'editors/schematic': { colours: 31, metrics: 185 },
   // colours 12 -> 7: the Symbol Editor parity pass. Four were
   // SYMBOL_EDITOR_COLORS, a private copy of LAYER_SCHEMATIC_ANCHOR /
   // LAYER_HIDDEN / LAYER_PRIVATE_NOTES / LAYER_FIELDS that matched the Default
@@ -333,6 +333,10 @@ const BASELINE: Record<string, { colours: number; metrics: number }> = {
   // counting rgb() at all - a hex-only rule would have reported 17 here.
   pcm: { colours: 193, metrics: 53 },
   render: { colours: 4, metrics: 0 },
+  // Live collaboration (designer/src/sync/). The only literals here are
+  // peerColor.ts's palette, which is data with no upstream table to cite;
+  // everything else in this area reaches for a token or a peer colour.
+  sync: { colours: 8, metrics: 0 },
   // ui/ is the shared layer itself, so its literals are the ones that ought to
   // BE tokens. shell.css is 7,000 lines and this is the size of that debt.
   //
@@ -631,7 +635,7 @@ const BASELINE: Record<string, { colours: number; metrics: number }> = {
   // metrics row is NOT lowered: the docked sign-in panel that replaced the
   // card added 15 chrome px literals and took 7 away, +8, and those still
   // stand — see the `[data]`/`[css]`/`[px]`/`[art]` rule above.
-  ui: { colours: 190, metrics: 707 },
+  ui: { colours: 190, metrics: 719 },
   // colours 6 -> 7: the opacity slider's #55585d track arrived here with
   // APPEARANCE_CONTROLS; it is the same literal `editors/pcb` lost, not a new
   // one. The panel's own stylesheet adds none: every length in
@@ -1042,7 +1046,15 @@ describe('the scan totals, so the numbers in the PR stay true', () => {
     // card's `#fff` text, `#aaa` detail, two backdrop/shadow rgba()s, the
     // gauge track's rgba() and the canvas spinner's `#ddd`) and
     // `editors/schematic` 33 -> 32 (the library browser's `#555`); 505 - 7.
-    expect(SITES.filter((s) => s.kind === 'colours').length).toBe(498);
+    // 498 -> 504: designer/src/sync/peerColor.ts's eight-entry
+    // PEER_COLOR_PALETTE arrives (+8) and the two REMOTE_CURSOR_COLOR
+    // literals it replaces go (-2), one in `editors/pcb` and one in
+    // `editors/schematic`. Genuine data, not chrome: no upstream KiCad table
+    // assigns a colour to "another viewer in this session," and the palette
+    // says so itself. RESCANNED, and the per-area table agrees three ways —
+    // a new `sync` row at 8, `editors/pcb` 38 -> 37, `editors/schematic`
+    // 32 -> 31, which is 498 + 8 - 2.
+    expect(SITES.filter((s) => s.kind === 'colours').length).toBe(504);
     // 1657 -> 1649: the same sweep. A native colour input has no useful
     // default size, so eight of the sixteen sites gave theirs an inline
     // width and height; the shared swatch takes --swatch-*-w/h. Rescanned.
@@ -1210,7 +1222,17 @@ describe('the scan totals, so the numbers in the PR stay true', () => {
     // WX_PROGRESS_REPORTER's dialog, is every number off the wx probe or Yaru's
     // stylesheet and carries its marker. `ui` 708 -> 707 is the only row that
     // moves, and 1297 - 1 agrees with it.
-    expect(SITES.filter((s) => s.kind === 'metrics').length).toBe(1296);
+    // 1296 -> 1308: PresencePanel.tsx's new `.ze-presence-*` rules in
+    // shell.css (a popup with no upstream KiCad counterpart to size from —
+    // see the colours entry above for why that is the same category as an
+    // invented literal being acceptable here) — +12. Not the same as the
+    // block's raw px count: CHROME_PROPS deliberately excludes `top` /
+    // `right` / `width` / `min-width` as ARRANGEMENT rather than chrome (see
+    // its own comment above), and the badge and panel are both
+    // `position: fixed` placed by exactly those four — so their padding, gap
+    // and border-radius are the twelve that count, not the eighteen-odd px
+    // values the block states in total. Rescanned on the rebased tree.
+    expect(SITES.filter((s) => s.kind === 'metrics').length).toBe(1308);
   });
 
   it('and the two agree with the per-area table, which is where they come from', () => {
