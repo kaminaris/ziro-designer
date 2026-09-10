@@ -10,6 +10,7 @@
  */
 
 import type { BoardPatch } from './pcb_diff.js';
+import type { SchematicPatch } from './sch_diff.js';
 
 export type EditorKind = 'schematic' | 'pcb' | 'symbol' | 'footprint';
 
@@ -66,9 +67,19 @@ export type ProjectSyncPayload =
   /** A compact, uuid-keyed diff (pcb_diff.ts) — the fast path for PCB sync,
    *  used whenever every touched item carries a uuid (real KiCad files
    *  always do). Falls back to 'model-changed' (whole board text) only
-   *  when that can't be trusted. No schematic equivalent yet — sheets are
-   *  already small enough that whole-text sync hasn't needed this. */
+   *  when that can't be trusted. */
   | { kind: 'board-patch'; patch: BoardPatch }
+  /**
+   * The same for one schematic sheet (sch_diff.ts). `sheetPath` identifies
+   * the sheet exactly as 'model-changed' does, because a patch is only
+   * meaningful against the sheet it was diffed from.
+   *
+   * Falls back to 'model-changed' for an edit that touches the retained
+   * root AST — page settings, the title block, embedded files — since the
+   * writer takes the header and every residual structural node from there
+   * and no item patch can describe it. Rare, and honest about it.
+   */
+  | { kind: 'sheet-patch'; sheetPath: string; patch: SchematicPatch }
   /**
    * A live, uncommitted drag preview — PCB only, plain move/drag (not the
    * router's push-and-shove, which rebuilds stretched geometry every frame

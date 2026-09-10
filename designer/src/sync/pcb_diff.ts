@@ -35,11 +35,17 @@ import type {
   PcbDimension,
   PcbGroup,
 } from '@ziroeda/pcbnew';
+import {
+  applyCollectionPatch,
+  diffCollection,
+  UNSAFE,
+  type CollectionPatch,
+} from './collection_diff.js';
 
-export interface CollectionPatch<T> {
-  upsert: T[];
-  remove: string[];
-}
+// The uuid-keyed diff itself is shared with the schematic's own patch
+// (sch_diff.ts); re-exported because this module was its only home first and
+// is where its callers already look.
+export { diffCollection, UNSAFE, type CollectionPatch };
 
 export interface BoardPatch {
   footprints?: CollectionPatch<PcbFootprint>;
@@ -60,49 +66,6 @@ export interface BoardPatch {
    * sent as a whole rather than field-by-field.
    */
   meta?: Pick<Board, 'layers' | 'nets' | 'titleBlock' | 'paper' | 'thickness' | 'version'>;
-}
-
-/** Sentinel distinct from `undefined` (= "no change, omit this collection"):
- *  some item has no uuid, so identity across the two arrays cannot be
- *  trusted. Kept distinct from "no change" deliberately — collapsing them
- *  would make diffBoard treat every unrelated, unchanged, uuid-less-item
- *  collection as a reason to abandon the *entire* patch, when only an
- *  actually-changed collection missing uuids is a real problem. */
-export const UNSAFE = Symbol('pcb-diff-unsafe');
-
-/**
- * Diff one item collection by uuid. Returns `undefined` when the collection
- * has no changes (omit it from the patch), the sentinel `UNSAFE` when some
- * item has no uuid (the caller falls back to whole-board sync for this
- * edit rather than risk a wrong splice), or the patch itself.
- *
- * Reference (not deep) equality decides "changed": every pure edit function
- * in this codebase produces a new object only for the items it actually
- * touches (`arr.map(x => touched.has(x.uuid) ? {...x, ...} : x)`), so an
- * untouched item keeps its exact prior reference. That is what makes a
- * "select all, nudge one" pass produce a one-item patch, not a whole-board
- * one — confirmed against the real functions this diffs the output of.
- */
-export function diffCollection<T extends { uuid?: string }>(
-  prev: readonly T[],
-  next: readonly T[],
-): CollectionPatch<T> | undefined | typeof UNSAFE {
-  const prevByUuid = new Map<string, T>();
-  for (const item of prev) {
-    if (!item.uuid) return UNSAFE;
-    prevByUuid.set(item.uuid, item);
-  }
-  const nextUuids = new Set<string>();
-  const upsert: T[] = [];
-  for (const item of next) {
-    if (!item.uuid) return UNSAFE;
-    nextUuids.add(item.uuid);
-    if (prevByUuid.get(item.uuid) !== item) upsert.push(item);
-  }
-  const remove: string[] = [];
-  for (const uuid of prevByUuid.keys()) if (!nextUuids.has(uuid)) remove.push(uuid);
-  if (upsert.length === 0 && remove.length === 0) return undefined; // no change: omit
-  return { upsert, remove };
 }
 
 function metaChanged(prev: Board, next: Board): boolean {
@@ -160,28 +123,6 @@ export function diffBoard(prev: Board, next: Board): BoardPatch | null {
     };
   }
   return patch;
-}
-
-function applyCollectionPatch<T extends { uuid?: string }>(
-  items: readonly T[],
-  patch: CollectionPatch<T> | undefined,
-): T[] {
-  if (!patch) return items as T[];
-  const removeSet = new Set(patch.remove);
-  const upsertByUuid = new Map(patch.upsert.map((item) => [item.uuid!, item]));
-  const out: T[] = [];
-  for (const item of items) {
-    if (item.uuid && removeSet.has(item.uuid)) continue;
-    if (item.uuid && upsertByUuid.has(item.uuid)) {
-      out.push(upsertByUuid.get(item.uuid)!);
-      upsertByUuid.delete(item.uuid);
-    } else {
-      out.push(item);
-    }
-  }
-  // Whatever is left in upsertByUuid is genuinely new (not a replace).
-  for (const item of upsertByUuid.values()) out.push(item);
-  return out;
 }
 
 /** Splice a patch into a (typically different, receiver-local) board. */

@@ -18,6 +18,12 @@ import { resolveActiveSheet, readSheetRef, writeSheetRefText } from '@ziroeda/co
 import { Fragment, useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { parse } from '@ziroeda/sexpr';
 import { useProjectSync } from '../../sync/ProjectSyncProvider.js';
+import {
+  applySchematicPatch,
+  diffSchematic,
+  schematicPatchIsEmpty,
+  type SchematicPatch,
+} from '../../sync/sch_diff.js';
 import type {
   PeerRole,
   PresenceInfo,
@@ -963,10 +969,21 @@ export function SchematicEditor({
   // applySheetDocument below — it needs sheetInstanceRefs/applySheetDocument,
   // both defined later in this component, hence the queue rather than
   // applying inline here).
-  const [pendingRemoteChange, setPendingRemoteChange] = useState<{
-    sheetPath: string;
-    text: string;
-  } | null>(null);
+  const [pendingRemoteChange, setPendingRemoteChange] = useState<
+    | { sheetPath: string; text: string; patch?: undefined }
+    | { sheetPath: string; patch: SchematicPatch; text?: undefined }
+    | null
+  >(null);
+  /**
+   * The sheet state this tab last broadcast, and which sheet it was — the
+   * base `diffSchematic` measures the next edit against.
+   *
+   * Keyed by path because switching sheets replaces `doc` wholesale: diffing
+   * sheet B against sheet A would describe every item on both as changed,
+   * which is not just wasteful but wrong. A switch therefore falls back to
+   * whole text once, and patches resume from there.
+   */
+  const prevSyncedDoc = useRef<{ path: string; doc: Schematic } | null>(null);
   // Last text this tab is responsible for having produced on the active
   // sheet — set both when broadcasting a local edit and when applying a
   // remote one, so applying a remote change doesn't immediately echo it
@@ -992,6 +1009,8 @@ export function SchematicEditor({
         setRemoteCursors((prev) => new Map(prev).set(fromPeerId, { x: payload.x, y: payload.y }));
       } else if (payload.kind === 'model-changed') {
         setPendingRemoteChange({ sheetPath: payload.sheetPath, text: payload.text });
+      } else if (payload.kind === 'sheet-patch') {
+        setPendingRemoteChange({ sheetPath: payload.sheetPath, patch: payload.patch });
       } else if (payload.kind === 'self-role') {
         // Locally synthesized, not peer-authored — see PcbEditor.tsx's own
         // copy of this branch and the payload's own doc comment.
@@ -1050,8 +1069,22 @@ export function SchematicEditor({
       } catch {
         return;
       }
+      // Recorded even when this turns out to be our own echo, so the next
+      // real edit diffs against what the group actually has rather than
+      // against whatever this tab last sent.
+      const base = prevSyncedDoc.current?.path === currentPath ? prevSyncedDoc.current.doc : null;
+      prevSyncedDoc.current = { path: currentPath, doc };
       if (text === lastKnownText.current) return;
       lastKnownText.current = text;
+      // The fast path: a handful of changed items instead of the whole sheet,
+      // `lib_symbols` cache and title block. Null means this edit touched the
+      // retained AST (page settings, embedded files) and cannot be described
+      // as items — see sch_diff.ts.
+      const patch = base ? diffSchematic(base, doc) : null;
+      if (patch && !schematicPatchIsEmpty(patch)) {
+        syncTransport.current?.publish({ kind: 'sheet-patch', sheetPath: currentPath, patch });
+        return;
+      }
       syncTransport.current?.publish({ kind: 'model-changed', sheetPath: currentPath, text });
     }, 400);
     return () => clearTimeout(timer);
@@ -3478,17 +3511,36 @@ export function SchematicEditor({
   // other cross-sheet edit. Not a merge: last update to arrive wins.
   useEffect(() => {
     if (!pendingRemoteChange) return;
-    const { sheetPath, text } = pendingRemoteChange;
+    const { sheetPath } = pendingRemoteChange;
     setPendingRemoteChange(null);
     const target = sheetInstanceRefs.find((r) => r.path === sheetPath);
     if (!target) return; // not (yet) part of this tab's loaded hierarchy
     let next: Schematic;
-    try {
-      next = { ...readSchematic(parse(text)), fileName: target.file };
-    } catch {
-      return; // malformed text mid-broadcast; wait for the next update
+    if (pendingRemoteChange.patch) {
+      // A patch is only meaningful against the sheet it was diffed from, so
+      // it needs this tab's current copy of that sheet to splice into.
+      const current =
+        target.file === currentFile ? docRef.current : project.current.docs.get(target.file);
+      if (!current) return; // the sheet is named but not loaded here
+      next = applySchematicPatch(current, pendingRemoteChange.patch);
+    } else {
+      try {
+        next = { ...readSchematic(parse(pendingRemoteChange.text)), fileName: target.file };
+      } catch {
+        return; // malformed text mid-broadcast; wait for the next update
+      }
     }
-    if (target.file === currentFile) lastKnownText.current = text;
+    if (target.file === currentFile) {
+      // Echo suppression works off text either way, so a patch has to be
+      // serialized here — the alternative is re-broadcasting what we just
+      // received. Cheaper than it looks: this runs once per received edit,
+      // not once per frame, and only for the sheet on screen.
+      try {
+        lastKnownText.current = serializeSchematic(next);
+      } catch {
+        lastKnownText.current = null; // unserializable: fall back to sending text next time
+      }
+    }
     applyingRemoteRef.current = true;
     try {
       applySheetDocument(target.file, next, 'Remote update');
