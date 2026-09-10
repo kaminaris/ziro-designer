@@ -965,6 +965,19 @@ export function SchematicEditor({
   // Other peers' last-known cursor world position, keyed by peerId. Cleared
   // per-peer on their next 'presence' drop (see the presence handler below).
   const [remoteCursors, setRemoteCursors] = useState<Map<string, Vec2>>(new Map());
+  /**
+   * What each peer currently has selected, by item uuid.
+   *
+   * Stored unresolved, as uuids, exactly as they arrived. `refId` already
+   * makes a schematic id BE the item's uuid (`uuid ?? kind:idx:index`), so
+   * unlike the board -- whose ids are positional and have to be translated
+   * per peer -- nothing has to be mapped here. What still has to be checked
+   * is the sheet: a uuid selected on another sheet means nothing on this
+   * one, which is why every read of this filters through presence.
+   */
+  const [remoteSelections, setRemoteSelections] = useState<Map<string, ReadonlySet<string>>>(
+    new Map(),
+  );
   // A remote sheet-text update waiting to be applied (see the effect near
   // applySheetDocument below — it needs sheetInstanceRefs/applySheetDocument,
   // both defined later in this component, hence the queue rather than
@@ -1003,6 +1016,22 @@ export function SchematicEditor({
         setRemoteCursors((prev) => {
           const next = new Map(prev);
           for (const peerId of next.keys()) if (!stillHere.has(peerId)) next.delete(peerId);
+          return next;
+        });
+        setRemoteSelections((prev) => {
+          const next = new Map(prev);
+          for (const peerId of next.keys()) if (!stillHere.has(peerId)) next.delete(peerId);
+          return next;
+        });
+      } else if (payload.kind === 'selection') {
+        // A board tab on this project shares the channel (it is keyed on the
+        // project, not the editor) and sends its own uuids here too. Harmless:
+        // they are uuids of board items, which no sheet has, so they resolve
+        // to nothing when drawn or locked against.
+        setRemoteSelections((prev) => {
+          const next = new Map(prev);
+          if (payload.refs.length === 0) next.delete(fromPeerId);
+          else next.set(fromPeerId, new Set(payload.refs));
           return next;
         });
       } else if (payload.kind === 'cursor') {
@@ -1051,8 +1080,36 @@ export function SchematicEditor({
         })),
     [syncPeers, remoteCursors, currentPath],
   );
+  /** The same sheet filter, for what each peer has selected. */
+  const remoteSelectionList = useMemo(
+    () =>
+      syncPeers
+        .filter(
+          (p) => p.sheetPath === currentPath && (remoteSelections.get(p.peerId)?.size ?? 0) > 0,
+        )
+        .map((p) => ({ peerId: p.peerId, ids: remoteSelections.get(p.peerId)! })),
+    [syncPeers, remoteSelections, currentPath],
+  );
+  /**
+   * Everything a peer on this sheet has claimed by selecting it
+   * (designer/src/sync/) — the board editor's `remoteLockedIds`, which this
+   * mirrors, explains why a selection is a claim worth honouring.
+   *
+   * No translation step, unlike the board's: a schematic id already IS the
+   * uuid, so a peer's ids and this tab's ids are the same strings.
+   */
+  const remoteLockedIds = useMemo(() => {
+    const locked = new Set<string>();
+    for (const { ids } of remoteSelectionList) for (const id of ids) locked.add(id);
+    return locked;
+  }, [remoteSelectionList]);
   useEffect(() => {
-    syncTransport.current?.publish({ kind: 'selection', refs: [...selection] });
+    // Only ids that are really uuids. `refId` falls back to `kind:idx:index`
+    // for an item with no uuid of its own, and that names a position in THIS
+    // tab's arrays -- sent as-is it would land on whatever item happened to
+    // sit at that index on the receiver, which is worse than sending nothing.
+    const refs = [...selection].filter((id) => !id.includes(':idx:'));
+    syncTransport.current?.publish({ kind: 'selection', refs });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selection]);
   // Broadcast the active sheet's edits (designer/src/sync/), debounced so a
@@ -9819,6 +9876,8 @@ export function SchematicEditor({
               onEditDrawingSheet={() => setPageSettingsOpen(true)}
               onCursorMove={onCursorMove}
               remoteCursors={remoteCursorList}
+              remoteSelections={remoteSelectionList}
+              lockedIds={remoteLockedIds}
               onScaleChange={onScaleChange}
             />
             {ctxMenu && (

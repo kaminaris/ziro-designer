@@ -27,6 +27,7 @@ import {
   findTargetSheet,
   copySelectionText,
   selectionBBox,
+  hasExtent,
   type BBox,
   PREVIEW_JUNCTION_DIAMETER_IU,
   makeJunctionWithUuid,
@@ -691,6 +692,19 @@ interface Props {
   /** Other viewers' live cursor positions (designer/src/sync/) — no upstream
    *  KiCad counterpart, KiCad has no notion of another viewer. World coords. */
   remoteCursors?: readonly { peerId: string; label: string; world: Vec2 }[];
+  /** What each other viewer has selected on THIS sheet, by uuid — drawn as
+   *  their own dashed box, and claimed: see `lockedIds`. */
+  remoteSelections?: readonly { peerId: string; ids: ReadonlySet<string> }[];
+  /**
+   * Items another viewer has claimed by selecting them (designer/src/sync/).
+   *
+   * A grab on any of these is refused before it starts, which is the board
+   * editor's `beginMove` guard: letting the drag run and discarding it on
+   * drop would mean the item follows your cursor and then snaps back, and
+   * the whole point of a lock is to be visible while you are pushing
+   * against it rather than after.
+   */
+  lockedIds?: ReadonlySet<string>;
   /**
    * A click landed on an ERC marker. `SCH_MARKER_T` is "always selectable" in
    * `SCH_SELECTION_TOOL`, and selecting one cross-probes to the ERC dialog
@@ -851,6 +865,8 @@ export const SchematicCanvas = forwardRef<CanvasController, Props>(function Sche
     onPasteDone,
     ercMarkers,
     remoteCursors,
+    remoteSelections,
+    lockedIds,
     onMarkerPick,
     onCommand,
     onDropIntoSheet,
@@ -965,6 +981,20 @@ export const SchematicCanvas = forwardRef<CanvasController, Props>(function Sche
   // Live document, readable from effects that must not re-run when it changes.
   const schematicRef = useRef(schematic);
   schematicRef.current = schematic;
+
+  /**
+   * Whether any of `ids` is currently claimed by another viewer
+   * (designer/src/sync/) — the guard every grab runs before it starts.
+   *
+   * A short-circuit on the empty set, like the board's `isRemoteLocked`, so
+   * a released claim never leaves anything blocked: with nobody else on the
+   * sheet this costs one `.size` check per gesture.
+   */
+  const isRemotelyLocked = (ids: ReadonlySet<string>): boolean => {
+    if (!lockedIds || lockedIds.size === 0) return false;
+    for (const id of ids) if (lockedIds.has(id)) return true;
+    return false;
+  };
 
   const modeRef = useRef<Mode>('idle');
   const panLastRef = useRef<{ x: number; y: number } | null>(null);
@@ -1510,6 +1540,7 @@ export const SchematicCanvas = forwardRef<CanvasController, Props>(function Sche
       // break, not from wherever the pointer was when the menu was dismissed.
       moveStartRef.current = plan.at ?? cursor;
       moveDeltaRef.current = { x: 0, y: 0 };
+      if (isRemotelyLocked(effSelRef.current)) return; // a peer's claim
       modeRef.current = 'move';
       grabbedRef.current = true;
       requestDraw();
@@ -1541,6 +1572,7 @@ export const SchematicCanvas = forwardRef<CanvasController, Props>(function Sche
       return;
     }
 
+    if (isRemotelyLocked(selection)) return; // designer/src/sync/ — a peer's claim
     const anchors = selectionAnchors(schematic, libById, selection);
     const origin = cursorRef.current ? snap(cursorRef.current) : (anchors[0] ?? null);
     if (!origin) return;
@@ -2548,6 +2580,35 @@ export const SchematicCanvas = forwardRef<CanvasController, Props>(function Sche
         ctx.stroke();
       }
       ctx.setTransform(1, 0, 0, 1, 0, 0);
+    }
+
+    // What other viewers have selected (designer/src/sync/), one dashed box
+    // per peer in that peer's own colour, labelled the same way their cursor
+    // is. Drawn under the cursors so a peer's own pointer stays on top of
+    // their box. Ids that name nothing on this sheet -- a board tab's uuids
+    // arriving on the shared channel -- yield an empty box and are skipped.
+    if (remoteSelections && remoteSelections.length > 0) {
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      for (const rs of remoteSelections) {
+        const present = new Set([...rs.ids].filter((id) => hasExtent(schematic, id, libById)));
+        if (present.size === 0) continue;
+        const bb = selectionBBox(schematic, present, libById);
+        const x0 = bb.minX * vp.scale + vp.offsetX;
+        const y0 = bb.minY * vp.scale + vp.offsetY;
+        const x1 = bb.maxX * vp.scale + vp.offsetX;
+        const y1 = bb.maxY * vp.scale + vp.offsetY;
+        const color = peerColor(rs.peerId);
+        ctx.save();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 3]);
+        ctx.strokeRect(Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0));
+        ctx.setLineDash([]);
+        ctx.font = '11px sans-serif';
+        ctx.fillStyle = color;
+        ctx.fillText(rs.peerId.slice(0, 4), Math.min(x0, x1), Math.min(y0, y1) - 4);
+        ctx.restore();
+      }
     }
 
     // Other viewers' cursors (designer/src/sync/) — no upstream KiCad
@@ -3734,6 +3795,8 @@ export const SchematicCanvas = forwardRef<CanvasController, Props>(function Sche
         gripped,
       });
       if (start !== 'box') {
+        // Refused before anything moves, so the item visibly does not grab.
+        if (isRemotelyLocked(requested)) return; // designer/src/sync/
         const effSel: ReadonlySet<string> = requested;
         // Upstream only *trims* a non-empty selection here; it is `SelectPoint`
         // inside RequestSelection that picks something up, and that only runs
