@@ -185,8 +185,15 @@ describe('the overlay fallback is wired for a drag that started in place', () =>
 
 describe('a remote drag draws with the current render closure', () => {
   it('the long-lived sync subscription never calls its captured requestDraw', () => {
-    const start = text.indexOf('const transport = createProjectSyncTransport(projectName);');
-    const end = text.indexOf('}, [projectName, myDisplayName]);', start);
+    // Now MORE load-bearing than when this was written, not less: the
+    // subscription used to be re-created whenever the project name or the
+    // display name changed, and since ProjectSyncProvider took ownership of
+    // the connection it only re-runs when the transport itself does. A
+    // `requestDraw()` captured in that closure would therefore go stale and
+    // stay stale, painting a remote drag with a render closure from whenever
+    // the tab connected.
+    const start = text.indexOf('const transport = sharedSync;');
+    const end = text.indexOf('}, [sharedSync]);', start);
     expect(start).toBeGreaterThan(-1);
     expect(end).toBeGreaterThan(start);
     const subscription = text.slice(start, end);
