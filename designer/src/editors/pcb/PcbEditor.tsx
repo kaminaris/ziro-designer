@@ -248,11 +248,7 @@ import {
   hasUnlockedItems,
 } from '@ziroeda/pcbnew/src/pcb_selection_conditions.js';
 import { Icon } from '../../ui/icons.js';
-import {
-  posturePath,
-  routedPath as routeDecision,
-  routeObstacleHulls,
-} from './route_tool.js';
+import { posturePath, routedPath as routeDecision, routeObstacleHulls } from './route_tool.js';
 import type { Hull } from '@ziroeda/pcbnew/src/router/pns_hull.js';
 import { ReferenceImageCache } from './image_cache.js';
 import { cleanup3dCache } from './model_cache.js';
