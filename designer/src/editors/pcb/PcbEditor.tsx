@@ -504,7 +504,7 @@ import {
   PCB_SPECIAL,
 } from './pcbTheme.js';
 import { PcbPropertiesPanel } from './PcbPropertiesPanel.js';
-import { createProjectSyncTransport } from '../../sync/createProjectSyncTransport.js';
+import { useProjectSync } from '../../sync/ProjectSyncProvider.js';
 import type {
   PeerRole,
   PresenceInfo,
@@ -1041,7 +1041,6 @@ export function PcbEditor({
   openNonce,
   shown = true,
   projectName,
-  projectUid,
   projectFiles,
   rootPro,
   onPersistFiles,
@@ -1103,10 +1102,6 @@ export function PcbEditor({
   shown?: boolean;
   /** Project name shown as "<project>, PCB Editor" in the menu bar. */
   projectName?: string;
-  /** `projects.uid`, when this project has synced at least once. Undefined for
-   *  a local-only project, which is what puts live sync on the same-browser
-   *  transport instead; see createProjectSyncTransport.ts. */
-  projectUid?: string | null;
   /** The open project's files (name + text), lets the 3D viewer resolve
    *  ${KIPRJMOD}/relative model references to project-bundled files. */
   projectFiles?: { name: string; text: string }[];
@@ -1483,6 +1478,9 @@ export function PcbEditor({
   // back to the peerId-derived label exactly as before this existed.
   const { session } = useAuth();
   const myDisplayName = session?.user.email ?? null;
+  /** The tab's one connection, owned by ProjectSyncProvider rather than by
+   *  this editor — see the comment on the subscription effect below. */
+  const sharedSync = useProjectSync();
   const [presencePanelOpen, setPresencePanelOpen] = useState(false);
   // Read by draw() via .current, same as cursorRef — avoids adding a state
   // dependency to that callback's tightly-scoped deps array.
@@ -1612,13 +1610,12 @@ export function PcbEditor({
    *  is a no-op rather than a redundant full parse + commit. */
   const receivedSnapshotRef = useRef(false);
   useEffect(() => {
-    if (!projectName) return undefined;
-    const transport = createProjectSyncTransport(projectName, {
-      uid: projectUid,
-      userId: session?.user.id ?? null,
-    });
+    // The connection belongs to the tab, not to this editor: both editors stay
+    // mounted, so owning one here made the tab its own peer. See
+    // designer/src/sync/ProjectSyncProvider.tsx.
+    const transport = sharedSync;
+    if (!transport) return undefined;
     syncTransport.current = transport;
-    transport.connect('pcb', null, { displayName: myDisplayName });
     const unsubscribe = transport.onMessage((payload, fromPeerId) => {
       if (payload.kind === 'presence') {
         setSyncPeers(payload.peers);
@@ -1865,16 +1862,14 @@ export function PcbEditor({
       }
     });
     return () => {
+      // Unsubscribe only. Disconnecting is the provider's job -- this editor
+      // stays mounted and hidden when the user switches to the schematic, and
+      // tearing the tab's connection down here would take presence with it.
       unsubscribe();
-      transport.disconnect();
       syncTransport.current = null;
     };
-    // `projectUid` and the account are in here because they decide WHICH
-    // transport this is (see createProjectSyncTransport.ts): a project that
-    // finishes its first sync, or a user signing in, has to reconnect on the
-    // cross-device channel rather than stay on the same-browser one.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectName, myDisplayName, projectUid, session?.user.id]);
+  }, [sharedSync]);
   // Broadcast board edits (designer/src/sync/), debounced so a run of small
   // edits collapses into one message. Prefers the compact uuid-keyed diff
   // (pcb_diff.ts) — a moved footprint or a shoved trace is then a handful of

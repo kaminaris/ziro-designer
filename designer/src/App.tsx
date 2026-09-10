@@ -16,6 +16,8 @@ import { HomePage } from './home/HomePage.js';
 import type { PickedFile } from './editors/schematic/SchematicEditor.js';
 import { EMPTY_PCB } from './home/new_project.js';
 import { ProgressDialog } from './ui/ProgressDialog.js';
+import { ProjectSyncProvider } from './sync/ProjectSyncProvider.js';
+import type { EditorKind } from './sync/ProjectSyncTransport.js';
 import {
   storageAvailable,
   cloudIdentityOf,
@@ -1254,6 +1256,21 @@ export function App(): JSX.Element {
   // menu bar. With several projects in a folder, it names the active one.
   const projectName = activeBase || folderName;
 
+  /**
+   * Which editor to announce to other people on this project.
+   *
+   * `view` has more states than presence does — the calculator and the gerber
+   * viewer are not places you can be *in a project* with somebody — so those
+   * map to the schematic rather than inventing an `EditorKind` for a screen
+   * nobody can collaborate on. See designer/src/sync/ProjectSyncProvider.tsx.
+   */
+  const syncView: EditorKind = useMemo(() => {
+    if (view === 'pcb') return 'pcb';
+    if (view === 'symbols') return 'symbol';
+    if (view === 'footprints') return 'footprint';
+    return 'schematic';
+  }, [view]);
+
   // The crash screen's "download your project before reloading" is the whole
   // point of `recovery.ts`, and nothing had ever registered a provider — so it
   // always found nothing and told the user *"No open project was in memory, so
@@ -1580,7 +1597,7 @@ export function App(): JSX.Element {
   }
 
   return (
-    <>
+    <ProjectSyncProvider projectName={projectName} projectUid={openUid} view={syncView}>
       {manager}
       {view !== 'home' && <SaveIndicator />}
       {schMounted && (
@@ -1648,7 +1665,6 @@ export function App(): JSX.Element {
                 shown={view === 'schematic'}
                 extraSheetFiles={sessionSheets}
                 projectName={projectName}
-                projectUid={openUid}
                 readOnlyNotice={demoNotice}
                 readOnly={!!demoProject}
                 onCrossProbeNet={setCrossProbeNet}
@@ -1682,7 +1698,6 @@ export function App(): JSX.Element {
                   persistFilesNow([{ name, text }]);
                 }}
                 projectName={projectName}
-                projectUid={openUid}
                 projectFiles={projectFiles ?? undefined}
                 rootPro={activeBase || undefined}
                 onPersistFiles={persistFilesNow}
@@ -1800,6 +1815,6 @@ export function App(): JSX.Element {
           </Frozen>
         </div>
       )}
-    </>
+    </ProjectSyncProvider>
   );
 }

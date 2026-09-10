@@ -17,7 +17,7 @@ import {
 import { resolveActiveSheet, readSheetRef, writeSheetRefText } from '@ziroeda/common';
 import { Fragment, useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { parse } from '@ziroeda/sexpr';
-import { createProjectSyncTransport } from '../../sync/createProjectSyncTransport.js';
+import { useProjectSync } from '../../sync/ProjectSyncProvider.js';
 import type {
   PeerRole,
   PresenceInfo,
@@ -764,7 +764,6 @@ export function SchematicEditor({
   shown = true,
   extraSheetFiles,
   projectName,
-  projectUid,
   rootPro,
   onCrossProbeNet,
   syncSelectionFromPcb,
@@ -862,10 +861,6 @@ export function SchematicEditor({
   extraSheetFiles?: PickedFile[];
   /** Project name shown as "<project>, Schematic Editor" in the menu bar. */
   projectName?: string;
-  /** `projects.uid`, when this project has synced at least once. Undefined for
-   *  a local-only project, which is what puts live sync on the same-browser
-   *  transport instead; see createProjectSyncTransport.ts. */
-  projectUid?: string | null;
   /** Basename of the active project's .kicad_pro (no extension). When a folder
    *  holds several projects, this pins which one's root sheet to load, so the
    *  editor matches the launcher tree instead of guessing the first/last pro. */
@@ -937,6 +932,9 @@ export function SchematicEditor({
   // and docs/proposals/multiplayer-architecture.md requirement 5).
   const { session } = useAuth();
   const myDisplayName = session?.user.email ?? null;
+  /** The tab's one connection, owned by ProjectSyncProvider rather than by
+   *  this editor — see the comment on the subscription effect below. */
+  const sharedSync = useProjectSync();
   // This tab's own role in the live session — see PcbEditor.tsx's own copy
   // of this comment and designer/src/sync/ProjectSyncTransport.ts's
   // PeerRole. Read by runCommand/applySheetDocument to refuse a local edit
@@ -975,13 +973,12 @@ export function SchematicEditor({
   // straight back out (see the broadcast effect below).
   const lastKnownText = useRef<string | null>(null);
   useEffect(() => {
-    if (!projectName) return undefined;
-    const transport = createProjectSyncTransport(projectName, {
-      uid: projectUid,
-      userId: session?.user.id ?? null,
-    });
+    // The connection belongs to the tab, not to this editor: both editors
+    // stay mounted, so owning one here made the tab its own peer. See
+    // designer/src/sync/ProjectSyncProvider.tsx.
+    const transport = sharedSync;
+    if (!transport) return undefined;
     syncTransport.current = transport;
-    transport.connect('schematic', currentPath, { displayName: myDisplayName });
     const unsubscribe = transport.onMessage((payload, fromPeerId) => {
       if (payload.kind === 'presence') {
         setSyncPeers(payload.peers);
@@ -1005,19 +1002,23 @@ export function SchematicEditor({
       }
     });
     return () => {
+      // Unsubscribe only. Disconnecting is the provider's job -- this editor
+      // stays mounted and hidden when the user switches to the board, and
+      // tearing the tab's connection down here would take presence with it.
       unsubscribe();
-      transport.disconnect();
       syncTransport.current = null;
     };
-    // `projectUid` and the account are in here because they decide WHICH
-    // transport this is (see createProjectSyncTransport.ts): a project that
-    // finishes its first sync, or a user signing in, has to reconnect on the
-    // cross-device channel rather than stay on the same-browser one.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectName, myDisplayName, projectUid, session?.user.id]);
+  }, [sharedSync]);
+  // This editor owns the sheet half of presence, because it is the only
+  // thing that knows which sheet is open. `shown` -- the prop the host
+  // already passes to say which editor is in front -- is in the deps, so
+  // arriving back from the board re-announces the sheet the provider could
+  // not name when it announced the view.
   useEffect(() => {
-    syncTransport.current?.updatePresence('schematic', currentPath);
-  }, [currentPath]);
+    if (!shown) return;
+    sharedSync?.updatePresence('schematic', currentPath);
+  }, [currentPath, shown, sharedSync]);
   // Only show a peer's cursor while they're on the same sheet — a position
   // from another sheet would land on unrelated geometry here.
   const remoteCursorList = useMemo(

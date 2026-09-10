@@ -44,10 +44,21 @@ describe('a viewer cannot originate an edit', () => {
 });
 
 describe('the transport keeps this tab in step with its own role', () => {
-  it("connects with this tab's real identity", () => {
-    const i = text.indexOf("transport.connect('pcb', null,");
+  it("takes the tab's shared connection instead of opening one of its own", () => {
+    // Both editors stay mounted, so an editor that connects for itself makes
+    // the tab a second peer of itself — see ProjectSyncProvider.tsx and
+    // project_sync_provider.test.ts, which pins the connect side.
+    expect(text).toContain('const sharedSync = useProjectSync();');
+    expect(text).not.toContain('createProjectSyncTransport(');
+  });
+
+  it('never disconnects the shared transport on its own teardown', () => {
+    // Hiding this editor must not take the tab's presence down with it.
+    const i = text.indexOf('const transport = sharedSync;');
     expect(i).toBeGreaterThan(-1);
-    expect(text.slice(i, i + 80)).toContain('{ displayName: myDisplayName }');
+    const body = text.slice(i, text.indexOf('}, [sharedSync]);', i));
+    expect(body).toContain('unsubscribe();');
+    expect(body).not.toContain('transport.disconnect()');
   });
 
   it("applies a 'self-role' message to React state, not just a ref", () => {
