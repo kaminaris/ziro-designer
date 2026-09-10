@@ -1041,6 +1041,7 @@ export function PcbEditor({
   openNonce,
   shown = true,
   projectName,
+  projectUid,
   projectFiles,
   rootPro,
   onPersistFiles,
@@ -1102,6 +1103,10 @@ export function PcbEditor({
   shown?: boolean;
   /** Project name shown as "<project>, PCB Editor" in the menu bar. */
   projectName?: string;
+  /** `projects.uid`, when this project has synced at least once. Undefined for
+   *  a local-only project, which is what puts live sync on the same-browser
+   *  transport instead; see createProjectSyncTransport.ts. */
+  projectUid?: string | null;
   /** The open project's files (name + text), lets the 3D viewer resolve
    *  ${KIPRJMOD}/relative model references to project-bundled files. */
   projectFiles?: { name: string; text: string }[];
@@ -1608,7 +1613,10 @@ export function PcbEditor({
   const receivedSnapshotRef = useRef(false);
   useEffect(() => {
     if (!projectName) return undefined;
-    const transport = createProjectSyncTransport(projectName);
+    const transport = createProjectSyncTransport(projectName, {
+      uid: projectUid,
+      userId: session?.user.id ?? null,
+    });
     syncTransport.current = transport;
     transport.connect('pcb', null, { displayName: myDisplayName });
     const unsubscribe = transport.onMessage((payload, fromPeerId) => {
@@ -1861,8 +1869,12 @@ export function PcbEditor({
       transport.disconnect();
       syncTransport.current = null;
     };
+    // `projectUid` and the account are in here because they decide WHICH
+    // transport this is (see createProjectSyncTransport.ts): a project that
+    // finishes its first sync, or a user signing in, has to reconnect on the
+    // cross-device channel rather than stay on the same-browser one.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectName, myDisplayName]);
+  }, [projectName, myDisplayName, projectUid, session?.user.id]);
   // Broadcast board edits (designer/src/sync/), debounced so a run of small
   // edits collapses into one message. Prefers the compact uuid-keyed diff
   // (pcb_diff.ts) — a moved footprint or a shoved trace is then a handful of

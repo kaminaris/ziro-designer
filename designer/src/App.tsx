@@ -1648,6 +1648,7 @@ export function App(): JSX.Element {
                 shown={view === 'schematic'}
                 extraSheetFiles={sessionSheets}
                 projectName={projectName}
+                projectUid={openUid}
                 readOnlyNotice={demoNotice}
                 readOnly={!!demoProject}
                 onCrossProbeNet={setCrossProbeNet}
@@ -1681,6 +1682,7 @@ export function App(): JSX.Element {
                   persistFilesNow([{ name, text }]);
                 }}
                 projectName={projectName}
+                projectUid={openUid}
                 projectFiles={projectFiles ?? undefined}
                 rootPro={activeBase || undefined}
                 onPersistFiles={persistFilesNow}

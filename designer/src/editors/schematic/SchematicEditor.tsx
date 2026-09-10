@@ -764,6 +764,7 @@ export function SchematicEditor({
   shown = true,
   extraSheetFiles,
   projectName,
+  projectUid,
   rootPro,
   onCrossProbeNet,
   syncSelectionFromPcb,
@@ -861,6 +862,10 @@ export function SchematicEditor({
   extraSheetFiles?: PickedFile[];
   /** Project name shown as "<project>, Schematic Editor" in the menu bar. */
   projectName?: string;
+  /** `projects.uid`, when this project has synced at least once. Undefined for
+   *  a local-only project, which is what puts live sync on the same-browser
+   *  transport instead; see createProjectSyncTransport.ts. */
+  projectUid?: string | null;
   /** Basename of the active project's .kicad_pro (no extension). When a folder
    *  holds several projects, this pins which one's root sheet to load, so the
    *  editor matches the launcher tree instead of guessing the first/last pro. */
@@ -971,7 +976,10 @@ export function SchematicEditor({
   const lastKnownText = useRef<string | null>(null);
   useEffect(() => {
     if (!projectName) return undefined;
-    const transport = createProjectSyncTransport(projectName);
+    const transport = createProjectSyncTransport(projectName, {
+      uid: projectUid,
+      userId: session?.user.id ?? null,
+    });
     syncTransport.current = transport;
     transport.connect('schematic', currentPath, { displayName: myDisplayName });
     const unsubscribe = transport.onMessage((payload, fromPeerId) => {
@@ -1001,8 +1009,12 @@ export function SchematicEditor({
       transport.disconnect();
       syncTransport.current = null;
     };
+    // `projectUid` and the account are in here because they decide WHICH
+    // transport this is (see createProjectSyncTransport.ts): a project that
+    // finishes its first sync, or a user signing in, has to reconnect on the
+    // cross-device channel rather than stay on the same-browser one.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectName, myDisplayName]);
+  }, [projectName, myDisplayName, projectUid, session?.user.id]);
   useEffect(() => {
     syncTransport.current?.updatePresence('schematic', currentPath);
   }, [currentPath]);
