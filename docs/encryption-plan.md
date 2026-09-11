@@ -190,8 +190,8 @@ it is for:
   presence arrived, so this item stopped being hypothetical: the cross-device
   transport was sending every payload body, every cursor and every selection
   in the clear, and announcing each peer's open sheet path in its presence
-  record — the same paths P1 encrypts in `projects.enc_meta`, handed straight
-  back. Both now go under the project key. Two fields stay readable because
+  record, which is the same path P1 encrypts in `projects.enc_meta`, handed
+  straight back. Both now go under the project key. Two fields stay readable because
   they have to: `peerId`, which is what Realtime routes on, and `userId`,
   which joins a peer to its role in `project_roster()` and which the server
   holds anyway in `project_members`. A peer with no key sends nothing at all
