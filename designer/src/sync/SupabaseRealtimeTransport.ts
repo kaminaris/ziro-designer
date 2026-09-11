@@ -2,6 +2,7 @@
 // Copyright (C) 2026 ZiroEDA and contributors.
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { cloudBackend } from '../cloud/cloudStore.js';
+import { projectKeyFor, sessionUnlocked } from '../cloud/session_keys.js';
 import type {
   EditorKind,
   PeerRole,
@@ -9,19 +10,29 @@ import type {
   ProjectSyncPayload,
   ProjectSyncTransport,
 } from './ProjectSyncTransport.js';
+import {
+  openPayload,
+  openPresence,
+  type PresenceSecrets,
+  sealPayload,
+  sealPresence,
+} from './sync_crypto.js';
 
 /**
- * What each peer publishes about itself on the channel. Deliberately small:
- * everything here is self-reported and therefore untrusted, so the only
- * fields are the ones a peer is the sole authority on — where it is looking.
- * Identity and role are NOT taken from here; see `roster` below.
+ * What each peer publishes about itself on the channel.
+ *
+ * Two fields in the clear, and both have to be: `peerId` is the presence key
+ * Realtime routes on, and `userId` is what turns a peer into a role by joining
+ * it against `project_roster()` — a fact the server holds anyway, in
+ * `project_members` and in the socket's own authentication. Everything else a
+ * peer says about itself is in `enc` (see `sync_crypto.ts`), because the rest
+ * of it — which sheet, which name — is project content.
  */
-interface PresenceMeta {
+interface WireMeta {
   peerId: string;
   userId: string;
-  view: EditorKind;
-  sheetPath: string | null;
-  displayName: string | null;
+  /** `PresenceSecrets`, sealed under the project key. */
+  enc: string;
 }
 
 /** The channel name for a project. `uid` and never `(user_id, id)`, for the
@@ -35,12 +46,27 @@ const channelName = (uid: string): string => `project:${uid}`;
 const EVENT = 'sync';
 
 /**
+ * How many messages may wait for the project key before the oldest is dropped.
+ *
+ * The wait is one database round trip, taken once per connection, so a queue
+ * this deep is already far past anything a healthy connection produces. It
+ * exists so that the answer to "what happens to an edit made in that window"
+ * is "it is sent, a moment later" rather than "it is lost" — a `sheet-patch`
+ * nobody resends is a peer permanently behind, unlike a cursor.
+ */
+const MAX_PENDING = 200;
+
+/** Presence ciphertexts remembered, so a channel full of peers does not
+ *  re-decrypt every record on every join and leave. */
+const META_CACHE_LIMIT = 256;
+
+/**
  * Cross-device sync over Supabase Realtime.
  *
  * The same `ProjectSyncTransport` the same-browser `BroadcastChannelTransport`
- * implements, so no editor knows which one it is talking to. Two things are
- * genuinely different here, and both are improvements the database made
- * possible rather than choices:
+ * implements, so no editor knows which one it is talking to. Three things are
+ * genuinely different here, and all three are consequences of there being a
+ * server rather than choices:
  *
  * **Roles are read, not elected.** `BroadcastChannelTransport` has to invent an
  * owner (first peer to find nobody else present claims it) because a
@@ -55,11 +81,25 @@ const EVENT = 'sync';
  * is what a cursor list has to show. Their role is the same in both, because
  * role is a fact about the account.
  *
+ * **Nothing legible leaves the device.** Every payload body and the readable
+ * half of every presence record is sealed under the project key first — see
+ * `sync_crypto.ts` for what stays in the clear and why. This is the transport
+ * that has a server in the middle, so it is the transport that needs it;
+ * `BroadcastChannelTransport` deliberately has none, because a BroadcastChannel
+ * never leaves the browser that opened it and encrypting a message to yourself
+ * protects nobody.
+ *
+ * The rule that falls out of that: **without a key, this sends nothing at all.**
+ * Not a cleartext fallback — a project whose key this account does not hold is
+ * a project whose live traffic would otherwise be readable by the server, which
+ * is the exact thing the encryption work was for. A keyless connection reports
+ * an empty peer list and stays quiet, which the editor already copes with.
+ *
  * Failure is not fatal, ever: multiplayer is additive (requirement 9 in
- * docs/proposals/multiplayer-architecture.md). If the channel never subscribes
- * or the roster cannot be read, this reports an empty peer list and the editor
- * carries on exactly as it does with nobody else around. It never blocks,
- * refuses or delays an edit.
+ * docs/proposals/multiplayer-architecture.md). If the channel never subscribes,
+ * the roster cannot be read, or no key can be had, this reports an empty peer
+ * list and the editor carries on exactly as it does with nobody else around. It
+ * never blocks, refuses or delays an edit.
  */
 export class SupabaseRealtimeTransport implements ProjectSyncTransport {
   readonly peerId = crypto.randomUUID();
@@ -79,6 +119,38 @@ export class SupabaseRealtimeTransport implements ProjectSyncTransport {
   /** Last role announced to the UI, so a roster refresh only emits `self-role`
    *  when the answer actually changed. */
   private announcedRole: PeerRole | null = null;
+
+  /** The project key, once it has been fetched. Null means nothing may be
+   *  sent; see the class comment. */
+  private key: Uint8Array | null = null;
+  /** The in-flight fetch, so an inbound message that beats it can wait for it
+   *  instead of being dropped. */
+  private keyPromise: Promise<Uint8Array | null> | null = null;
+  /** Set once the fetch has come back empty: publishes stop queueing and start
+   *  being dropped, because no later event will produce a key. */
+  private keyless = false;
+
+  /** Published before the key arrived, in order. */
+  private pending: ProjectSyncPayload[] = [];
+
+  /**
+   * Inbound and outbound are each a promise chain rather than a set of loose
+   * `void`ed promises.
+   *
+   * Sealing and opening are both async, and a patch applied in the wrong order
+   * is a corrupted board — `a then b` and `b then a` do not agree for a diff.
+   * Chaining costs one microtask per message and makes the delivered order the
+   * order they were published and received in.
+   */
+  private inbound: Promise<void> = Promise.resolve();
+  private outbound: Promise<void> = Promise.resolve();
+
+  /** Opened presence records, keyed by their ciphertext. */
+  private metaCache = new Map<string, PresenceSecrets | null>();
+  /** Guards against an older presence resolve emitting after a newer one. */
+  private presenceToken = 0;
+
+  private warned = false;
 
   constructor(
     private readonly supabase: SupabaseClient,
@@ -109,16 +181,20 @@ export class SupabaseRealtimeTransport implements ProjectSyncTransport {
 
     channel.on('presence', { event: 'sync' }, () => this.emitPresence());
     channel.on('broadcast', { event: EVENT }, ({ payload }) => {
-      const wire = payload as { from: string; body: ProjectSyncPayload } | undefined;
-      if (!wire?.from || !wire.body) return;
+      const wire = payload as { from?: string; enc?: string } | undefined;
+      if (!wire?.from || typeof wire.enc !== 'string') return;
       if (wire.from === this.peerId) return; // belt and braces; `self: false` already did this
-      for (const h of this.handlers) h(wire.body, wire.from);
+      const { from, enc } = wire;
+      this.inbound = this.inbound.then(() => this.deliver(from, enc));
     });
 
-    channel.subscribe((status) => {
-      if (status !== 'SUBSCRIBED') return;
-      void channel.track(this.meta());
-    });
+    // Nothing is tracked here. Presence carries the sheet path, so announcing
+    // before the key exists would publish in the clear the one field P1 went
+    // out of its way to encrypt; `adoptKey` tracks the moment there is a key.
+    channel.subscribe(() => undefined);
+
+    this.keyPromise = this.loadKey();
+    void this.keyPromise.then((key) => this.adoptKey(channel, key));
 
     // Not awaited: presence must not wait on the roster, and the roster is
     // only ever an enrichment of a peer list that is already correct.
@@ -128,7 +204,7 @@ export class SupabaseRealtimeTransport implements ProjectSyncTransport {
   updatePresence(view: EditorKind, sheetPath: string | null): void {
     this.selfView = view;
     this.selfSheetPath = sheetPath;
-    void this.channel?.track(this.meta());
+    void this.trackSelf();
   }
 
   /**
@@ -141,7 +217,7 @@ export class SupabaseRealtimeTransport implements ProjectSyncTransport {
    */
   setRole(role: PeerRole): void {
     this.selfRole = role;
-    void this.channel?.track(this.meta());
+    void this.trackSelf();
   }
 
   disconnect(): void {
@@ -149,6 +225,12 @@ export class SupabaseRealtimeTransport implements ProjectSyncTransport {
     this.channel = null;
     this.roster.clear();
     this.announcedRole = null;
+    this.key = null;
+    this.keyPromise = null;
+    this.keyless = false;
+    this.pending = [];
+    this.metaCache.clear();
+    this.presenceToken++;
     if (channel) void this.supabase.removeChannel(channel);
   }
 
@@ -160,11 +242,16 @@ export class SupabaseRealtimeTransport implements ProjectSyncTransport {
       void this.assignRole(payload.toPeerId, payload.role);
       return;
     }
-    void this.channel?.send({
-      type: 'broadcast',
-      event: EVENT,
-      payload: { from: this.peerId, body: payload },
-    });
+    if (this.key) {
+      this.queueSend(this.key, payload);
+      return;
+    }
+    // No key yet. Either it is still being fetched, in which case this waits
+    // for it, or there will never be one, in which case it is dropped — never
+    // sent in the clear.
+    if (this.keyless) return;
+    this.pending.push(payload);
+    if (this.pending.length > MAX_PENDING) this.pending.shift();
   }
 
   onMessage(handler: (payload: ProjectSyncPayload, fromPeerId: string) => void): () => void {
@@ -174,15 +261,80 @@ export class SupabaseRealtimeTransport implements ProjectSyncTransport {
     };
   }
 
-  /** This peer's own presence record. */
-  private meta(): PresenceMeta {
-    return {
-      peerId: this.peerId,
-      userId: this.userId,
+  /** The project key for this account, or null if there is none to be had. */
+  private async loadKey(): Promise<Uint8Array | null> {
+    const be = cloudBackend();
+    if (!be || !sessionUnlocked()) return null;
+    try {
+      return await projectKeyFor(be, this.userId, this.projectUid);
+    } catch {
+      return null; // locked, no row, or a backend that does not hold keys
+    }
+  }
+
+  /** Take delivery of the key: announce, and release whatever was waiting. */
+  private adoptKey(channel: unknown, key: Uint8Array | null): void {
+    if (this.channel !== channel) return; // disconnected while we were asking
+    if (!key) {
+      this.keyless = true;
+      this.pending = [];
+      this.warnOnce(
+        'sync: no key for this project, so nothing will be sent — live collaboration is off',
+      );
+      return;
+    }
+    this.key = key;
+    void this.trackSelf();
+    const queued = this.pending;
+    this.pending = [];
+    for (const payload of queued) this.queueSend(key, payload);
+    this.emitPresence();
+  }
+
+  /** Announce this peer, with everything but the routing fields sealed. */
+  private async trackSelf(): Promise<void> {
+    const key = this.key;
+    const channel = this.channel;
+    if (!key || !channel) return;
+    const enc = await sealPresence(key, {
       view: this.selfView,
       sheetPath: this.selfSheetPath,
       displayName: this.selfDisplayName,
-    };
+    });
+    if (this.channel !== channel) return; // disconnected while we were sealing
+    const meta: WireMeta = { peerId: this.peerId, userId: this.userId, enc };
+    await channel.track(meta);
+  }
+
+  private queueSend(key: Uint8Array, payload: ProjectSyncPayload): void {
+    this.outbound = this.outbound.then(async () => {
+      const channel = this.channel;
+      if (!channel) return;
+      const enc = await sealPayload(key, payload);
+      if (this.channel !== channel) return;
+      await channel.send({
+        type: 'broadcast',
+        event: EVENT,
+        payload: { from: this.peerId, enc },
+      });
+    });
+  }
+
+  /** Open one inbound message and hand it on. */
+  private async deliver(from: string, enc: string): Promise<void> {
+    const key = this.key ?? (await (this.keyPromise ?? Promise.resolve(null)));
+    if (!key || !this.channel) return;
+    let body: ProjectSyncPayload;
+    try {
+      body = await openPayload(key, enc);
+    } catch {
+      // A peer holding a different key, or a message altered in flight. Either
+      // way there is nothing to apply and nothing worth taking an editor down
+      // for.
+      this.warnOnce('sync: a message on this project could not be opened and was ignored');
+      return;
+    }
+    for (const h of this.handlers) h(body, from);
   }
 
   /**
@@ -191,7 +343,8 @@ export class SupabaseRealtimeTransport implements ProjectSyncTransport {
    * The payload names a *peer*, because that is what a cursor list shows;
    * membership names an *account*. Presence is what maps one to the other, so
    * an assignment to a peer that has since gone simply finds nothing and does
-   * nothing, rather than guessing.
+   * nothing, rather than guessing. It reads `userId` straight off the wire
+   * record, which is in the clear precisely so this join needs no key.
    */
   private async assignRole(toPeerId: string, role: 'editor' | 'viewer'): Promise<void> {
     const target = this.peers().find((p) => p.peerId === toPeerId);
@@ -230,36 +383,82 @@ export class SupabaseRealtimeTransport implements ProjectSyncTransport {
     this.emitPresence();
   }
 
-  /** Every peer currently tracked on the channel, this tab included. */
-  private peers(): PresenceMeta[] {
-    const state = this.channel?.presenceState<PresenceMeta>() ?? {};
+  /** Every peer currently tracked on the channel, this tab included, still
+   *  sealed. */
+  private peers(): WireMeta[] {
+    const state = this.channel?.presenceState<WireMeta>() ?? {};
     return Object.values(state)
       .flat()
-      .filter((m): m is PresenceMeta & { presence_ref: string } => !!m && !!m.peerId);
+      .filter((m): m is WireMeta & { presence_ref: string } => !!m && !!m.peerId);
   }
 
   /**
    * Publish the peer list, minus this tab.
    *
+   * Opening each record is async, so this starts the work and lets the newest
+   * start win: presence syncs arrive in bursts as people join, and an older
+   * resolve landing after a newer one would show a list that has already been
+   * superseded.
+   */
+  private emitPresence(): void {
+    const token = ++this.presenceToken;
+    void this.resolvePresence(token);
+  }
+
+  /**
    * Role and display name are taken from the roster and not from what the peer
    * said about itself: one is a database fact and the other is a claim. A peer
    * the roster has not answered for yet falls back to its own announcement,
    * which is what makes the list correct immediately and merely better later.
+   *
+   * A peer whose record will not open is left out entirely rather than shown
+   * with blanks — it holds a different key, so it is not really on this
+   * project, and a nameless row in the panel explains nothing to anybody.
    */
-  private emitPresence(): void {
-    const peers: PresenceInfo[] = this.peers()
-      .filter((m) => m.peerId !== this.peerId)
-      .map((m) => {
-        const known = this.roster.get(m.userId);
-        return {
-          peerId: m.peerId,
-          view: m.view,
-          sheetPath: m.sheetPath,
-          role: known?.role ?? 'editor',
-          displayName: known?.email ?? m.displayName,
-        };
+  private async resolvePresence(token: number): Promise<void> {
+    const key = this.key;
+    if (!key) return;
+    const peers: PresenceInfo[] = [];
+    for (const m of this.peers()) {
+      if (m.peerId === this.peerId) continue;
+      const secrets = await this.openMeta(key, m.enc);
+      if (!secrets) continue;
+      const known = this.roster.get(m.userId);
+      peers.push({
+        peerId: m.peerId,
+        view: secrets.view,
+        sheetPath: secrets.sheetPath,
+        role: known?.role ?? 'editor',
+        displayName: known?.email ?? secrets.displayName,
       });
+    }
+    if (token !== this.presenceToken || !this.channel) return;
     for (const h of this.handlers) h({ kind: 'presence', peers }, this.peerId);
+  }
+
+  private async openMeta(key: Uint8Array, enc: string): Promise<PresenceSecrets | null> {
+    const hit = this.metaCache.get(enc);
+    if (hit !== undefined) return hit;
+    let secrets: PresenceSecrets | null;
+    try {
+      secrets = await openPresence(key, enc);
+    } catch {
+      secrets = null;
+    }
+    // A peer republishes on every sheet change, so this is bounded by how much
+    // people move around, not by how many of them there are. Dropping the
+    // whole map is fine: the cost of a miss is one decrypt.
+    if (this.metaCache.size >= META_CACHE_LIMIT) this.metaCache.clear();
+    this.metaCache.set(enc, secrets);
+    return secrets;
+  }
+
+  /** One line per connection, not one per message: a key that is missing is
+   *  missing for every message, and a console full of it helps nobody. */
+  private warnOnce(message: string): void {
+    if (this.warned) return;
+    this.warned = true;
+    console.warn(message);
   }
 }
 
