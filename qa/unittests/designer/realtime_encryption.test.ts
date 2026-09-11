@@ -249,6 +249,19 @@ describe('a peer with no key is silent, not cleartext', () => {
     // the exact traffic the encryption work exists to hide.
     expect(hub.sent).toEqual([]);
     expect(hub.tracked).toEqual([]);
+
+    // The control. An empty hub is also what a harness that never ran
+    // produces, so the same hub is made to carry traffic from a peer that
+    // does hold a key — without this, the two assertions above would pass
+    // for the wrong reason and go on passing after the encryption was gone.
+    keyRef.current = KEY;
+    const withKey = makeTransport(hub, USER_B);
+    withKey.connect('schematic', '/b.kicad_sch', { displayName: 'b@example.com' });
+    withKey.publish({ kind: 'cursor', x: 5, y: 6 });
+    await settle();
+    expect(hub.tracked).toHaveLength(1);
+    expect(hub.sent).toHaveLength(1);
+    expect(hub.sent[0].from).toBe(withKey.peerId);
   });
 
   it('sends nothing when the account is locked', async () => {
@@ -263,6 +276,13 @@ describe('a peer with no key is silent, not cleartext', () => {
 
     expect(hub.sent).toEqual([]);
     expect(hub.tracked).toEqual([]);
+
+    // Same control, for the same reason.
+    unlockedRef.current = true;
+    const unlocked = makeTransport(hub, USER_B);
+    unlocked.connect('pcb', null, { displayName: 'b@example.com' });
+    await settle();
+    expect(hub.tracked).toHaveLength(1);
   });
 });
 
@@ -373,6 +393,11 @@ describe('a peer holding a different key is ignored, not trusted', () => {
     await settle();
 
     expect(got).toEqual([]);
+    // The control: A really did publish and the frame really did reach B,
+    // so the empty list above is B refusing to open it rather than nothing
+    // having happened.
+    expect(hub.sent).toHaveLength(1);
+    expect(hub.sent[0].from).toBe(a.peerId);
   });
 
   it('leaves a peer whose presence will not open out of the list', async () => {
