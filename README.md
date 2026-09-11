@@ -75,10 +75,24 @@ variables are absent, so a clone runs with no configuration at all.
 
 ### Cloud sync
 
-Run `supabase/projects.sql`, `supabase/storage.sql` and `supabase/manifest.sql`
-once each in the Supabase SQL editor, and turn on **object versioning** for the
-bucket. The app works without any of it — everything is local-first — but a
-deployment that syncs should have all four.
+Apply every file in `supabase/migrations/` **in filename order**, either with
+`supabase db push` against a linked project or by pasting each one into the SQL
+editor. They are ordered because later ones depend on earlier ones: project
+identity and membership come before the roster, and both come before the
+account and project keys that end-to-end encryption reads.
+
+Then create a storage bucket and name it in `VITE_SUPABASE_STORAGE_BUCKET`.
+Object versioning is optional rather than required, because blobs are
+content-addressed (below) and a write only ever adds.
+
+The app works without any of it, since everything is local-first, but a
+deployment that syncs needs the migrations, the bucket and the three
+`VITE_SUPABASE_*` variables.
+
+`supabase/tests/` holds the row-level-security tests; `run_rls_tests.sh` checks
+that membership, account keys and project keys really are unreadable to the
+wrong account, which is worth running against a new project before trusting it
+with anything.
 
 Project files are stored **content-addressed**: a blob's key is the SHA-256 of
 its bytes, at `<userId>/blobs/<hash>`. Three properties follow, and they are the
